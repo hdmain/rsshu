@@ -70,9 +70,9 @@ export function TitleBar({ title = "RSSHU" }: TitleBarProps) {
       data-tauri-drag-region
       className="flex h-8 shrink-0 select-none items-center justify-between border-b border-white/10 bg-[#070c18]/90 pl-3 text-[12px] text-slate-300 backdrop-blur"
     >
-      <div data-tauri-drag-region className="flex items-center gap-2">
-        <Terminal className="h-3.5 w-3.5 text-sky-400" />
-        <span data-tauri-drag-region className="font-medium tracking-wide">
+      <div data-tauri-drag-region className="flex min-w-0 flex-1 items-center gap-2">
+        <Terminal className="h-3.5 w-3.5 shrink-0 text-sky-400" />
+        <span data-tauri-drag-region className="truncate font-medium tracking-wide text-slate-200">
           {title}
         </span>
       </div>

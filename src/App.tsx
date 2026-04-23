@@ -139,15 +139,7 @@ type TopBarProps = {
 function TopBar({ screen, onChangeScreen, activeSessionCount, sftpConnected, onLock, right }: TopBarProps) {
   return (
     <header className="relative z-20 flex h-14 shrink-0 items-center justify-between gap-4 border-b border-white/10 bg-gradient-to-r from-[#0a1120] via-[#0b1326] to-[#0a1120] px-4 backdrop-blur">
-      <div className="flex items-center gap-3">
-        <div className="flex h-8 w-8 items-center justify-center rounded-md bg-gradient-to-br from-sky-500 to-indigo-500 shadow-[0_0_12px_rgba(56,189,248,0.35)]">
-          <Terminal className="h-4 w-4 text-white" />
-        </div>
-        <div className="leading-tight">
-          <p className="text-sm font-semibold tracking-wide text-slate-100">RSSHU</p>
-          <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">SSH / SFTP Console</p>
-        </div>
-        <div className="mx-2 hidden h-6 w-px bg-white/10 md:block" />
+      <div className="flex min-w-0 items-center gap-3">
         <div className="hidden items-center rounded-full border border-white/10 bg-white/5 p-1 text-xs md:flex">
           <button
             onClick={() => onChangeScreen("hosts")}
