@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { getTerminalClipboardBridge } from "@/lib/terminal-clipboard-bridge";
+import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
 
 type FieldTarget = HTMLInputElement | HTMLTextAreaElement;
 
@@ -75,7 +76,7 @@ export function GlobalContextMenu() {
         if (!b) return;
         const s = b.term.getSelection();
         if (!s) return;
-        await navigator.clipboard.writeText(s);
+        await writeText(s);
         return;
       }
       const el = menu.el;
@@ -84,7 +85,7 @@ export function GlobalContextMenu() {
       const b = el.selectionEnd ?? 0;
       const { value } = el;
       if (a === b) return;
-      await navigator.clipboard.writeText(value.slice(a, b));
+      await writeText(value.slice(a, b));
     } catch {
       // ignore
     } finally {
@@ -95,7 +96,7 @@ export function GlobalContextMenu() {
   const doPaste = async () => {
     if (!menu) return;
     try {
-      const text = await navigator.clipboard.readText();
+      const text = await readText();
       if (menu.kind === "xterm") {
         const br = getTerminalClipboardBridge();
         if (!br || !br.hasSession()) return;

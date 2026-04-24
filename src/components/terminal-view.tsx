@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { readText } from "@tauri-apps/plugin-clipboard-manager";
 import { setTerminalClipboardBridge } from "@/lib/terminal-clipboard-bridge";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
@@ -116,6 +117,20 @@ export function TerminalView({ tabId, sessionId, onDisconnected, keywordSettings
     term.loadAddon(fitAddon);
     term.loadAddon(webLinksAddon);
     term.open(hostRef.current);
+
+    term.attachCustomKeyEventHandler(async (e) => {
+      if (e.ctrlKey && e.key === 'v') {
+        e.preventDefault();
+        try {
+          const text = await readText();
+          term.paste(text);
+        } catch {
+          // ignore
+        }
+        return false;
+      }
+      return true;
+    });
 
     const safeFit = () => {
       try {
