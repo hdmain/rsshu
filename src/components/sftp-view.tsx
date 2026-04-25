@@ -60,6 +60,65 @@ type TrackedOpenFile = {
   editState: "synced" | "modified" | "uploading";
 };
 
+type SftpViewState = {
+  currentPath: string;
+  trackedOpen: TrackedOpenFile[];
+};
+
+/** Module-level cache — survives React unmount/remount within the same app session. */
+const _memCache = new Map<string, SftpViewState>();
+
+function saveViewState(sessionId: string, state: SftpViewState) {
+  _memCache.set(sessionId, state);
+  try {
+    localStorage.setItem(`rsshu.sftp.viewState.${sessionId}`, JSON.stringify(state));
+  } catch {
+    // storage quota exceeded — in-memory cache still works
+  }
+}
+
+function loadViewState(sessionId: string, home: string): SftpViewState {
+  const mem = _memCache.get(sessionId);
+  if (mem) return mem;
+  try {
+    const raw = localStorage.getItem(`rsshu.sftp.viewState.${sessionId}`);
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<SftpViewState>;
+      const trackedOpen = Array.isArray(parsed.trackedOpen)
+        ? (parsed.trackedOpen as Array<unknown>)
+            .filter((x): x is TrackedOpenFile => {
+              if (!x || typeof x !== "object") return false;
+              const item = x as Partial<TrackedOpenFile>;
+              return (
+                typeof item.id === "string" &&
+                typeof item.name === "string" &&
+                typeof item.localPath === "string" &&
+                typeof item.remotePath === "string" &&
+                typeof item.baselineMtime === "number" &&
+                typeof item.baselineSize === "number" &&
+                (item.editState === "synced" ||
+                  item.editState === "modified" ||
+                  item.editState === "uploading")
+              );
+            })
+            .map((item) => ({
+              ...item,
+              editState: item.editState === "uploading" ? ("modified" as const) : item.editState,
+            }))
+        : [];
+      return {
+        currentPath: typeof parsed.currentPath === "string"
+          ? normalizeFsPath(parsed.currentPath)
+          : normalizeFsPath(home),
+        trackedOpen,
+      };
+    }
+  } catch {
+    // ignore
+  }
+  return { currentPath: normalizeFsPath(home), trackedOpen: [] };
+}
+
 function formatSize(size: number, isDir: boolean): string {
   if (isDir) return "—";
   if (size < 1024) return `${size} B`;
@@ -137,14 +196,18 @@ export function SftpView({
   openEditMode,
   onDisconnect,
 }: SftpViewProps) {
-  const [currentPath, setCurrentPath] = useState<string>(() => normalizeFsPath(home || "/"));
+  const [currentPath, setCurrentPath] = useState<string>(
+    () => loadViewState(sessionId, home).currentPath,
+  );
   const [entries, setEntries] = useState<SftpEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string>("");
   const [busyPath, setBusyPath] = useState<string | null>(null);
   const [transfer, setTransfer] = useState<TransferInfo | null>(null);
   const [dragOver, setDragOver] = useState(false);
-  const [trackedOpen, setTrackedOpen] = useState<TrackedOpenFile[]>([]);
+  const [trackedOpen, setTrackedOpen] = useState<TrackedOpenFile[]>(
+    () => loadViewState(sessionId, home).trackedOpen,
+  );
   const trackedRef = useRef<TrackedOpenFile[]>([]);
   const dropZoneRef = useRef<HTMLDivElement | null>(null);
   const currentPathRef = useRef(currentPath);
@@ -166,6 +229,10 @@ export function SftpView({
     currentPathRef.current = currentPath;
   }, [currentPath]);
 
+  useEffect(() => {
+    saveViewState(sessionId, { currentPath, trackedOpen });
+  }, [sessionId, currentPath, trackedOpen]);
+
   const load = useCallback(
     async (path: string) => {
       setLoading(true);
@@ -185,8 +252,9 @@ export function SftpView({
   );
 
   useEffect(() => {
-    void load(home || "/");
-  }, [load, home]);
+    void load(currentPath);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [load]);
 
   const breadcrumbs = useMemo(() => segmentsOf(currentPath), [currentPath]);
 
@@ -627,7 +695,7 @@ export function SftpView({
           </div>
         ) : null}
 
-        <div className="grid grid-cols-[1fr_120px_200px_100px_120px] border-b border-white/5 bg-white/[0.02] px-3 py-1.5 text-[10px] uppercase tracking-wider text-slate-500">
+        <div className="grid grid-cols-[1fr_120px_200px_100px_120px] gap-x-2 border-b border-white/5 bg-white/[0.02] px-3 py-1.5 text-[10px] uppercase tracking-wider text-slate-500">
           <span>Name</span>
           <span className="text-right">Size</span>
           <span>Modified</span>
@@ -659,7 +727,7 @@ export function SftpView({
             return (
               <div
                 key={entry.path}
-                className="grid cursor-default grid-cols-[1fr_120px_200px_100px_120px] items-center gap-0 border-b border-white/[0.03] px-3 py-1.5 text-xs transition hover:bg-white/[0.04]"
+                className="grid cursor-default grid-cols-[1fr_120px_200px_100px_120px] items-center gap-x-2 border-b border-white/[0.03] px-3 py-1.5 text-xs transition hover:bg-white/[0.04]"
                 onDoubleClick={() => void onOpenFile(entry)}
               >
                 <div className="flex min-w-0 items-center gap-2 truncate">
