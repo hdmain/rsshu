@@ -39,3 +39,6 @@ Desktop.ini
 # Test / coverage
 coverage
 *.lcov
+
+# Release script (local automation, not part of the repo)
+release.py

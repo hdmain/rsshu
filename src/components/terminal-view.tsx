@@ -5,6 +5,8 @@ import { setTerminalClipboardBridge } from "@/lib/terminal-clipboard-bridge";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
+import { WebglAddon } from "@xterm/addon-webgl";
+import { ImageAddon, IImageAddonOptions } from "@xterm/addon-image";
 import "@xterm/xterm/css/xterm.css";
 
 const sessionBufferCache = new Map<string, string>();
@@ -77,13 +79,21 @@ export function TerminalView({ tabId, sessionId, onDisconnected, keywordSettings
     if (!hostRef.current) return;
     const term = new Terminal({
       cursorBlink: true,
+      cursorStyle: "block",
       convertEol: true,
       fontFamily: '"JetBrains Mono", "Cascadia Code", "Fira Code", Menlo, Consolas, monospace',
       fontSize: 13,
-      lineHeight: 1.25,
+      lineHeight: 1.2,
       letterSpacing: 0,
       scrollback: 10000,
-      allowTransparency: true,
+      allowTransparency: false, // must be false for WebGL renderer
+      // Ensure the internal canvas matches the physical pixel grid — this is
+      // what makes Terminus look sharper. xterm reads window.devicePixelRatio
+      // automatically when the WebGL renderer is active, but we also help the
+      // DOM fallback by not artificially squashing the canvas.
+      // Disable minimum contrast ratio enforcement so colors render exactly
+      // as the application sends them (matches Terminus default behaviour).
+      minimumContrastRatio: 1,
       theme: {
         background: "#050912",
         foreground: "#e2e8f0",
@@ -113,9 +123,38 @@ export function TerminalView({ tabId, sessionId, onDisconnected, keywordSettings
       // Open URLs emitted by terminal output in the system browser.
       void openUrl(uri);
     });
+
+    // Image protocol support (sixel + iTerm2 inline images).
+    const imageOptions: IImageAddonOptions = {
+      enableSizeReports: true,
+      pixelLimit: 16777216, // 16 MiB — allows large sixel/kitty images
+      storageLimit: 256,    // 256 MB image cache
+      sixelSupport: true,
+      sixelScrolling: true,
+      sixelPaletteLimit: 256,
+      iipSupport: true,     // iTerm2 inline image protocol
+    };
+    const imageAddon = new ImageAddon(imageOptions);
+
     term.loadAddon(fitAddon);
     term.loadAddon(webLinksAddon);
+    term.loadAddon(imageAddon);
     term.open(hostRef.current);
+
+    // WebGL renderer — GPU-accelerated, sharpest text + graphics.
+    // Falls back silently if WebGL is unavailable (e.g. in software rendering).
+    let webglAddon: WebglAddon | null = null;
+    try {
+      webglAddon = new WebglAddon();
+      webglAddon.onContextLoss(() => {
+        // Context lost (e.g. GPU driver reset). Dispose and fall back to DOM.
+        webglAddon?.dispose();
+        webglAddon = null;
+      });
+      term.loadAddon(webglAddon);
+    } catch {
+      // GPU unavailable — DOM renderer will be used automatically.
+    }
 
     const safeFit = () => {
       try {
@@ -161,6 +200,7 @@ export function TerminalView({ tabId, sessionId, onDisconnected, keywordSettings
       setTerminalClipboardBridge(null);
       window.removeEventListener("resize", onResize);
       observer?.disconnect();
+      webglAddon?.dispose();
       term.dispose();
       terminalRef.current = null;
       fitAddonRef.current = null;
