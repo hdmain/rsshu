@@ -1,6 +1,6 @@
 [package]
 name = "rsshu"
-version = "0.1.4"
+version = "0.1.5"
 description = "RSSHU - modern SSH/SFTP client"
 authors = ["makss"]
 edition = "2021"
