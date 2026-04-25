@@ -123,6 +123,61 @@ fn write_vault_file(path: &Path, key: &[u8; KEY_LEN], salt: &[u8; SALT_LEN], pla
     Ok(())
 }
 
+fn decrypt_vault_file_with_key(path: &Path, key: &[u8; KEY_LEN]) -> Result<Vec<u8>, String> {
+    let bytes = fs::read(path).map_err(|e| format!("read vault blob {}: {}", path.display(), e))?;
+    let file: VaultFile = serde_json::from_slice(&bytes).map_err(|e| format!("parse vault blob: {}", e))?;
+    if file.version != VAULT_VERSION {
+        return Err(format!("Unsupported vault version: {}", file.version));
+    }
+    let nonce_vec = B64.decode(file.nonce.as_bytes()).map_err(|e| e.to_string())?;
+    if nonce_vec.len() != NONCE_LEN {
+        return Err("Invalid nonce length".to_string());
+    }
+    let ciphertext = B64.decode(file.ciphertext.as_bytes()).map_err(|e| e.to_string())?;
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| format!("aes key: {}", e))?;
+    let nonce = Nonce::from_slice(&nonce_vec);
+    cipher
+        .decrypt(nonce, ciphertext.as_ref())
+        .map_err(|_| "decrypt failed".to_string())
+}
+
+pub(crate) fn vault_write_encrypted_blob(
+    app: &AppHandle,
+    vault: &State<'_, Vault>,
+    file_name: &str,
+    plaintext: &[u8],
+) -> Result<(), String> {
+    let base = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| format!("Could not resolve app data dir: {}", e))?;
+    fs::create_dir_all(&base).map_err(|e| format!("create data dir {}: {}", base.display(), e))?;
+    let path = base.join(file_name);
+    let inner = vault.inner.lock().map_err(|_| "Vault lock poisoned".to_string())?;
+    let key = inner.key.ok_or_else(|| "Vault is locked".to_string())?;
+    let salt = inner.salt.ok_or_else(|| "Vault is locked".to_string())?;
+    write_vault_file(&path, &key, &salt, plaintext)
+}
+
+pub(crate) fn vault_read_encrypted_blob(
+    app: &AppHandle,
+    vault: &State<'_, Vault>,
+    file_name: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    let base = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| format!("Could not resolve app data dir: {}", e))?;
+    let path = base.join(file_name);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let inner = vault.inner.lock().map_err(|_| "Vault lock poisoned".to_string())?;
+    let key = inner.key.ok_or_else(|| "Vault is locked".to_string())?;
+    let plain = decrypt_vault_file_with_key(&path, &key)?;
+    Ok(Some(plain))
+}
+
 #[tauri::command]
 pub fn vault_status(app: AppHandle, vault: State<'_, Vault>) -> Result<VaultStatus, String> {
     let path = vault_path(&app)?;
@@ -237,12 +292,10 @@ pub fn vault_change_password(
     if new_password.len() < 8 {
         return Err("Master password must be at least 8 characters".to_string());
     }
-    // Requires the vault to be currently unlocked.
-    {
-        let inner = vault.inner.lock().map_err(|_| "Vault lock poisoned".to_string())?;
-        if inner.key.is_none() {
-            return Err("Vault is locked".to_string());
-        }
+    // Keep this whole operation under one lock to avoid TOCTOU races.
+    let mut inner = vault.inner.lock().map_err(|_| "Vault lock poisoned".to_string())?;
+    if inner.key.is_none() {
+        return Err("Vault is locked".to_string());
     }
     let mut salt = [0u8; SALT_LEN];
     rand::thread_rng().fill_bytes(&mut salt);
@@ -250,7 +303,6 @@ pub fn vault_change_password(
     let path = vault_path(&app)?;
     write_vault_file(&path, &key, &salt, hosts_json.as_bytes())?;
 
-    let mut inner = vault.inner.lock().map_err(|_| "Vault lock poisoned".to_string())?;
     inner.clear();
     inner.key = Some(key);
     inner.salt = Some(salt);

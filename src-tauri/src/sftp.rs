@@ -8,6 +8,7 @@ use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::time::Duration;
 use tauri::State;
 use tempfile::NamedTempFile;
@@ -41,6 +42,7 @@ pub struct SftpEntry {
 
 pub struct SftpSessionState {
     session: Arc<Mutex<Session>>,
+    last_touch_ms: Arc<AtomicU64>,
 }
 
 pub struct SftpSessions {
@@ -60,6 +62,56 @@ impl SftpSessions {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         format!("sftp-session-{id}")
     }
+
+    pub fn reap_idle_sessions(&self, max_idle_ms: u64) -> usize {
+        let now = now_ms();
+        let mut stale: Vec<SftpSessionState> = Vec::new();
+        if let Ok(mut guard) = self.sessions.lock() {
+            let ids: Vec<String> = guard
+                .iter()
+                .filter_map(|(id, st)| {
+                    let last = st.last_touch_ms.load(Ordering::Relaxed);
+                    if now.saturating_sub(last) > max_idle_ms {
+                        Some(id.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for id in ids {
+                if let Some(state) = guard.remove(&id) {
+                    stale.push(state);
+                }
+            }
+        }
+        let count = stale.len();
+        for state in stale {
+            if let Ok(session) = state.session.lock() {
+                let _ = session.disconnect(None, "Idle timeout cleanup", None);
+            }
+        }
+        count
+    }
+
+    pub fn disconnect_all(&self, reason: &str) {
+        let sessions = if let Ok(mut guard) = self.sessions.lock() {
+            guard.drain().map(|(_, s)| s).collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        for state in sessions {
+            if let Ok(session) = state.session.lock() {
+                let _ = session.disconnect(None, reason, None);
+            }
+        }
+    }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn connect(req: &SftpConnectRequest) -> Result<Session> {
@@ -137,6 +189,7 @@ pub fn sftp_connect(
         id.clone(),
         SftpSessionState {
             session: Arc::new(Mutex::new(session)),
+            last_touch_ms: Arc::new(AtomicU64::new(now_ms())),
         },
     );
     Ok(SftpConnectResponse {
@@ -155,16 +208,55 @@ fn with_session<T, F: FnOnce(&Session) -> Result<T, String>>(
             .sessions
             .lock()
             .map_err(|_| "Session lock poisoned".to_string())?;
-        guard
+        let state = guard
             .get(session_id)
-            .ok_or_else(|| "SFTP session not found".to_string())?
-            .session
-            .clone()
+            .ok_or_else(|| "SFTP session not found".to_string())?;
+        state.last_touch_ms.store(now_ms(), Ordering::Relaxed);
+        state.session.clone()
     };
     let session = handle
         .lock()
         .map_err(|_| "SFTP session busy".to_string())?;
     f(&session)
+}
+
+#[tauri::command]
+pub fn sftp_read_file(
+    session_id: String,
+    path: String,
+    sessions: State<'_, SftpSessions>,
+) -> Result<String, String> {
+    with_session(&sessions, &session_id, |session| {
+        let sftp = session.sftp().map_err(|e| e.to_string())?;
+        let mut remote = sftp
+            .open(Path::new(&path))
+            .map_err(|e| format!("open {}: {}", path, e))?;
+        let mut bytes = Vec::new();
+        remote
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("read {}: {}", path, e))?;
+        String::from_utf8(bytes).map_err(|_| "File is not valid UTF-8 text".to_string())
+    })
+}
+
+#[tauri::command]
+pub fn sftp_write_file(
+    session_id: String,
+    path: String,
+    content: String,
+    sessions: State<'_, SftpSessions>,
+) -> Result<u64, String> {
+    with_session(&sessions, &session_id, |session| {
+        let sftp = session.sftp().map_err(|e| e.to_string())?;
+        let flags = OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE;
+        let mut remote = sftp
+            .open_mode(Path::new(&path), flags, 0o644, OpenType::File)
+            .map_err(|e| format!("open remote {}: {}", path, e))?;
+        remote
+            .write_all(content.as_bytes())
+            .map_err(|e| format!("write remote {}: {}", path, e))?;
+        Ok(content.len() as u64)
+    })
 }
 
 #[tauri::command]

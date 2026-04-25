@@ -12,8 +12,10 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
+use crate::vault::{self, Vault};
 
 const SYNC_FILE: &str = "sync.json";
+const SYNC_SECRETS_FILE: &str = "sync.secrets.vault";
 const KEY_LEN: usize = 32;
 const NONCE_LEN: usize = 12;
 const GIST_FILENAME: &str = "rsshu-sync.txt";
@@ -22,6 +24,14 @@ const GIST_FILENAME: &str = "rsshu-sync.txt";
 struct SyncConfig {
     enabled: bool,
     gist_id: String,
+    #[serde(default)]
+    key_b64: String,
+    #[serde(default)]
+    github_token: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct SyncSecrets {
     key_b64: String,
     github_token: String,
 }
@@ -93,6 +103,47 @@ fn write_sync_config(app: &AppHandle, cfg: &SyncConfig) -> Result<(), String> {
     let path = sync_path(app)?;
     let bytes = serde_json::to_vec_pretty(cfg).map_err(|e| e.to_string())?;
     fs::write(path, bytes).map_err(|e| format!("write sync config: {e}"))
+}
+
+fn read_sync_secrets(app: &AppHandle, vault_state: &State<'_, Vault>) -> Result<Option<SyncSecrets>, String> {
+    let Some(bytes) = vault::vault_read_encrypted_blob(app, vault_state, SYNC_SECRETS_FILE)? else {
+        return Ok(None);
+    };
+    let secrets: SyncSecrets =
+        serde_json::from_slice(&bytes).map_err(|e| format!("parse sync secrets: {e}"))?;
+    Ok(Some(secrets))
+}
+
+fn write_sync_secrets(
+    app: &AppHandle,
+    vault_state: &State<'_, Vault>,
+    secrets: &SyncSecrets,
+) -> Result<(), String> {
+    let bytes = serde_json::to_vec(secrets).map_err(|e| format!("serialize sync secrets: {e}"))?;
+    vault::vault_write_encrypted_blob(app, vault_state, SYNC_SECRETS_FILE, &bytes)
+}
+
+fn resolve_sync_secrets(
+    app: &AppHandle,
+    vault_state: &State<'_, Vault>,
+    cfg: &SyncConfig,
+) -> Result<SyncSecrets, String> {
+    // Backward compatibility + migration from old plaintext sync.json.
+    if !cfg.github_token.trim().is_empty() && !cfg.key_b64.trim().is_empty() {
+        let secrets = SyncSecrets {
+            key_b64: cfg.key_b64.clone(),
+            github_token: cfg.github_token.clone(),
+        };
+        write_sync_secrets(app, vault_state, &secrets)?;
+
+        let mut migrated = cfg.clone();
+        migrated.key_b64.clear();
+        migrated.github_token.clear();
+        write_sync_config(app, &migrated)?;
+        return Ok(secrets);
+    }
+    read_sync_secrets(app, vault_state)?
+        .ok_or_else(|| "Sync secrets missing. Re-enable sync while vault is unlocked.".to_string())
 }
 
 fn decode_key(key: &str) -> Result<[u8; KEY_LEN], String> {
@@ -233,6 +284,7 @@ pub fn sync_status(app: AppHandle, sync: State<'_, SyncState>) -> Result<SyncSta
 pub fn sync_enable(
     app: AppHandle,
     sync: State<'_, SyncState>,
+    vault_state: State<'_, Vault>,
     req: SyncEnableRequest,
 ) -> Result<SyncEnableResponse, String> {
     if req.github_token.trim().is_empty() {
@@ -255,9 +307,17 @@ pub fn sync_enable(
     let cfg = SyncConfig {
         enabled: true,
         gist_id: gist_id.clone(),
-        key_b64: key_b64.clone(),
-        github_token: req.github_token,
+        key_b64: String::new(),
+        github_token: String::new(),
     };
+    write_sync_secrets(
+        &app,
+        &vault_state,
+        &SyncSecrets {
+            key_b64: key_b64.clone(),
+            github_token: req.github_token,
+        },
+    )?;
     write_sync_config(&app, &cfg)?;
     let mut inner = sync.inner.lock().map_err(|_| "Sync lock poisoned".to_string())?;
     inner.config = Some(cfg);
@@ -275,6 +335,13 @@ pub fn sync_disable(app: AppHandle, sync: State<'_, SyncState>) -> Result<(), St
     if path.exists() {
         fs::remove_file(&path).map_err(|e| format!("remove sync config: {e}"))?;
     }
+    if let Ok(dir) = app.path().app_local_data_dir() {
+        let secrets_path = dir.join(SYNC_SECRETS_FILE);
+        if secrets_path.exists() {
+            fs::remove_file(&secrets_path)
+                .map_err(|e| format!("remove sync secrets: {e}"))?;
+        }
+    }
     let mut inner = sync.inner.lock().map_err(|_| "Sync lock poisoned".to_string())?;
     inner.config = None;
     inner.last_payload = None;
@@ -283,7 +350,12 @@ pub fn sync_disable(app: AppHandle, sync: State<'_, SyncState>) -> Result<(), St
 }
 
 #[tauri::command]
-pub fn sync_push(app: AppHandle, sync: State<'_, SyncState>, hosts_json: String) -> Result<(), String> {
+pub fn sync_push(
+    app: AppHandle,
+    sync: State<'_, SyncState>,
+    vault_state: State<'_, Vault>,
+    hosts_json: String,
+) -> Result<(), String> {
     let (cfg, should_skip) = {
         let mut inner = sync.inner.lock().map_err(|_| "Sync lock poisoned".to_string())?;
         if inner.config.is_none() {
@@ -301,9 +373,10 @@ pub fn sync_push(app: AppHandle, sync: State<'_, SyncState>, hosts_json: String)
     if should_skip {
         return Ok(());
     }
-    let key = decode_key(&cfg.key_b64)?;
+    let secrets = resolve_sync_secrets(&app, &vault_state, &cfg)?;
+    let key = decode_key(&secrets.key_b64)?;
     let (uuid, note) = make_note(&hosts_json, &key)?;
-    update_gist(&cfg.github_token, &cfg.gist_id, &note)?;
+    update_gist(&secrets.github_token, &cfg.gist_id, &note)?;
     let mut inner = sync.inner.lock().map_err(|_| "Sync lock poisoned".to_string())?;
     inner.last_payload = Some(hosts_json);
     inner.last_uuid = Some(uuid);
@@ -311,7 +384,11 @@ pub fn sync_push(app: AppHandle, sync: State<'_, SyncState>, hosts_json: String)
 }
 
 #[tauri::command]
-pub fn sync_pull(app: AppHandle, sync: State<'_, SyncState>) -> Result<String, String> {
+pub fn sync_pull(
+    app: AppHandle,
+    sync: State<'_, SyncState>,
+    vault_state: State<'_, Vault>,
+) -> Result<String, String> {
     let cfg = {
         let mut inner = sync.inner.lock().map_err(|_| "Sync lock poisoned".to_string())?;
         if inner.config.is_none() {
@@ -322,8 +399,9 @@ pub fn sync_pull(app: AppHandle, sync: State<'_, SyncState>) -> Result<String, S
             .clone()
             .ok_or_else(|| "Sync is not configured".to_string())?
     };
-    let key = decode_key(&cfg.key_b64)?;
-    let note = fetch_gist_note(&cfg.github_token, &cfg.gist_id)?;
+    let secrets = resolve_sync_secrets(&app, &vault_state, &cfg)?;
+    let key = decode_key(&secrets.key_b64)?;
+    let note = fetch_gist_note(&secrets.github_token, &cfg.gist_id)?;
     let (uuid, payload) = parse_note(&note, &key)?;
     let mut inner = sync.inner.lock().map_err(|_| "Sync lock poisoned".to_string())?;
     inner.last_payload = Some(payload.clone());
@@ -332,7 +410,11 @@ pub fn sync_pull(app: AppHandle, sync: State<'_, SyncState>) -> Result<String, S
 }
 
 #[tauri::command]
-pub fn sync_poll_updates(app: AppHandle, sync: State<'_, SyncState>) -> Result<SyncPollResponse, String> {
+pub fn sync_poll_updates(
+    app: AppHandle,
+    sync: State<'_, SyncState>,
+    vault_state: State<'_, Vault>,
+) -> Result<SyncPollResponse, String> {
     let (cfg, last_uuid) = {
         let mut inner = sync.inner.lock().map_err(|_| "Sync lock poisoned".to_string())?;
         if inner.config.is_none() {
@@ -353,8 +435,9 @@ pub fn sync_poll_updates(app: AppHandle, sync: State<'_, SyncState>) -> Result<S
         (cfg, inner.last_uuid.clone())
     };
 
-    let key = decode_key(&cfg.key_b64)?;
-    let note = fetch_gist_note(&cfg.github_token, &cfg.gist_id)?;
+    let secrets = resolve_sync_secrets(&app, &vault_state, &cfg)?;
+    let key = decode_key(&secrets.key_b64)?;
+    let note = fetch_gist_note(&secrets.github_token, &cfg.gist_id)?;
     let (remote_uuid, payload) = parse_note(&note, &key)?;
 
     if Some(remote_uuid.clone()) == last_uuid {

@@ -13,7 +13,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
 use tempfile::NamedTempFile;
 
 use sftp::SftpSessions;
@@ -224,6 +224,7 @@ struct ShellSession {
     output_rx: Receiver<String>,
     is_alive: Arc<AtomicBool>,
     ssh_session: Arc<Mutex<Session>>,
+    last_touch_ms: Arc<AtomicU64>,
 }
 
 enum WorkerCommand {
@@ -249,6 +250,54 @@ impl ShellSessions {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         format!("ssh-session-{id}")
     }
+
+    fn reap_idle_sessions(&self, max_idle_ms: u64) -> usize {
+        let now = now_ms();
+        let mut stale: Vec<ShellSession> = Vec::new();
+        if let Ok(mut guard) = self.sessions.lock() {
+            let ids: Vec<String> = guard
+                .iter()
+                .filter_map(|(id, s)| {
+                    let last = s.last_touch_ms.load(Ordering::Relaxed);
+                    if now.saturating_sub(last) > max_idle_ms {
+                        Some(id.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for id in ids {
+                if let Some(sess) = guard.remove(&id) {
+                    stale.push(sess);
+                }
+            }
+        }
+        for session in &stale {
+            let _ = session.command_tx.send(WorkerCommand::Close);
+        }
+        stale.len()
+    }
+
+    fn close_all(&self, reason: &str) {
+        let sessions = if let Ok(mut guard) = self.sessions.lock() {
+            guard.drain().map(|(_, s)| s).collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        for session in sessions {
+            let _ = session.command_tx.send(WorkerCommand::Close);
+            if let Ok(ssh) = session.ssh_session.lock() {
+                let _ = ssh.disconnect(None, reason, None);
+            }
+        }
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[tauri::command]
@@ -303,6 +352,7 @@ fn ssh_start_shell(
     let (output_tx, output_rx) = mpsc::channel::<String>();
     let is_alive = Arc::new(AtomicBool::new(true));
     let shared_session = Arc::new(Mutex::new(session.clone()));
+    let last_touch_ms = Arc::new(AtomicU64::new(now_ms()));
     let session_id = sessions.create_id();
     println!("[ssh] shell session allocated id={}", session_id);
     let worker_session_id = session_id.clone();
@@ -407,12 +457,10 @@ fn ssh_start_shell(
 
             if last_input_log.elapsed() >= Duration::from_millis(250) {
                 if input_bytes_since_log > 0 {
-                    for _ in 0..input_bytes_since_log {
-                        println!(
-                            "[ssh] input traffic session_id={} bytes_250ms=1",
-                            worker_session_id
-                        );
-                    }
+                    println!(
+                        "[ssh] input traffic session_id={} bytes_250ms={}",
+                        worker_session_id, input_bytes_since_log
+                    );
                     input_bytes_since_log = 0;
                 }
                 last_input_log = Instant::now();
@@ -478,6 +526,7 @@ fn ssh_start_shell(
             output_rx,
             is_alive,
             ssh_session: shared_session,
+            last_touch_ms,
         },
     );
 
@@ -658,6 +707,7 @@ fn ssh_send_input(
     let session = guard
         .get(&session_id)
         .ok_or_else(|| "Session not found".to_string())?;
+    session.last_touch_ms.store(now_ms(), Ordering::Relaxed);
     if !session.is_alive.load(Ordering::SeqCst) {
         return Err("Session is closed".to_string());
     }
@@ -678,6 +728,7 @@ fn ssh_resize_pty(
     let session = guard
         .get(&session_id)
         .ok_or_else(|| "Session not found".to_string())?;
+    session.last_touch_ms.store(now_ms(), Ordering::Relaxed);
     if !session.is_alive.load(Ordering::SeqCst) {
         return Err("Session is closed".to_string());
     }
@@ -696,6 +747,7 @@ fn ssh_read_output(
     let session = guard
         .get(&session_id)
         .ok_or_else(|| "Session not found".to_string())?;
+    session.last_touch_ms.store(now_ms(), Ordering::Relaxed);
     if !session.is_alive.load(Ordering::SeqCst) {
         return Err("Session is closed".to_string());
     }
@@ -748,7 +800,7 @@ fn ssh_close_shell(session_id: String, sessions: State<'_, ShellSessions>) -> Re
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .manage(ShellSessions::new())
         .manage(SftpSessions::new())
         .manage(Vault::new())
@@ -773,6 +825,8 @@ pub fn run() {
             sftp::sftp_rename,
             sftp::sftp_download,
             sftp::sftp_upload,
+            sftp::sftp_read_file,
+            sftp::sftp_write_file,
             sftp::sftp_disconnect,
             vault::vault_status,
             vault::vault_init,
@@ -788,6 +842,32 @@ pub fn run() {
             sync::sync_poll_updates,
             file_metadata,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .setup(|app| {
+            let app_handle = app.handle().clone();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(Duration::from_secs(30));
+                let shell_reaped = app_handle
+                    .state::<ShellSessions>()
+                    .reap_idle_sessions(5 * 60 * 1000);
+                let sftp_reaped = app_handle
+                    .state::<SftpSessions>()
+                    .reap_idle_sessions(5 * 60 * 1000);
+                if shell_reaped > 0 || sftp_reaped > 0 {
+                    println!(
+                        "[cleanup] reaped idle sessions shell={} sftp={}",
+                        shell_reaped, sftp_reaped
+                    );
+                }
+            });
+            Ok(())
+        })
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(move |app, event| {
+        if matches!(event, RunEvent::Exit) {
+            app.state::<ShellSessions>().close_all("App exiting");
+            app.state::<SftpSessions>().disconnect_all("App exiting");
+        }
+    });
 }
