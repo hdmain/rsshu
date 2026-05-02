@@ -20,6 +20,9 @@ use sftp::SftpSessions;
 use sync::SyncState;
 use vault::Vault;
 
+/// Shell/SFTP sessions with no activity for this long are closed by background cleanup.
+const IDLE_SESSION_MAX_MS: u64 = 2 * 60 * 60 * 1000;
+
 /// Many OpenSSH+PAM setups disable the `password` auth method and only accept
 /// `keyboard-interactive` (same password, different SSH message). Try both.
 struct PasswordKeyboardInteractive<'a> {
@@ -848,10 +851,10 @@ pub fn run() {
                 std::thread::sleep(Duration::from_secs(30));
                 let shell_reaped = app_handle
                     .state::<ShellSessions>()
-                    .reap_idle_sessions(5 * 60 * 1000);
+                    .reap_idle_sessions(IDLE_SESSION_MAX_MS);
                 let sftp_reaped = app_handle
                     .state::<SftpSessions>()
-                    .reap_idle_sessions(5 * 60 * 1000);
+                    .reap_idle_sessions(IDLE_SESSION_MAX_MS);
                 if shell_reaped > 0 || sftp_reaped > 0 {
                     println!(
                         "[cleanup] reaped idle sessions shell={} sftp={}",
