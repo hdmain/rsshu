@@ -1,5 +1,6 @@
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { readText } from "@tauri-apps/plugin-clipboard-manager";
 import { listen } from "@tauri-apps/api/event";
 import {
   ChevronDown,
@@ -253,10 +254,13 @@ function App() {
   const SFTP_OPEN_EDIT_KEY = "rsshu.settings.sftpOpenEditMode";
   const PRIVACY_REDACT_HOSTS_KEY = "rsshu.settings.privacyRedactHosts";
   const TERMINAL_HOST_INFO_BAR_KEY = "rsshu.settings.terminalHostInfoBar";
+  const TCPRAW_ENABLED_KEY = "rsshu.settings.tcprawEnabled";
   const [sftpHideDotfiles, setSftpHideDotfiles] = useState(false);
   const [sftpOpenEditMode, setSftpOpenEditMode] = useState<"auto" | "confirm">("auto");
   const [privacyRedactHosts, setPrivacyRedactHosts] = useState(false);
   const [showTerminalHostInfoBar, setShowTerminalHostInfoBar] = useState(true);
+  const [tcprawEnabled, setTcprawEnabled] = useState(false);
+  const [tcprawCode, setTcprawCode] = useState<string | null>(null);
   const [hostMetrics, setHostMetrics] = useState<SshHostMetricsResponse | null>(null);
   const [hostMetricsLoading, setHostMetricsLoading] = useState(false);
   const [hostMetricsError, setHostMetricsError] = useState("");
@@ -292,6 +296,15 @@ function App() {
     try {
       const v = localStorage.getItem(SFTP_OPEN_EDIT_KEY);
       if (v === "confirm") setSftpOpenEditMode("confirm");
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      const v = localStorage.getItem(TCPRAW_ENABLED_KEY);
+      if (v === "1" || v === "true") setTcprawEnabled(true);
     } catch {
       // ignore
     }
@@ -612,6 +625,22 @@ function App() {
       window.clearInterval(timer);
     };
   }, [showTerminalHostInfoBar, screen, terminalState, activeTab?.sessionId]);
+
+  useEffect(() => {
+    if (!tcprawEnabled || screen !== "terminal" || terminalState !== "connected" || !activeTab?.sessionId) {
+      setTcprawCode(null);
+      return;
+    }
+    const poll = window.setInterval(() => {
+      void readText()
+        .then((text: string) => {
+          const trimmed = (text ?? "").trim();
+          setTcprawCode(/^\d{6}$/.test(trimmed) ? trimmed : null);
+        })
+        .catch(() => setTcprawCode(null));
+    }, 600);
+    return () => window.clearInterval(poll);
+  }, [tcprawEnabled, screen, terminalState, activeTab?.sessionId]);
 
   const sidebarItems: Array<{ key: SidebarSection; label: string; icon: ReactNode }> = [
     { key: "hosts", label: "Hosts", icon: <Server className="h-4 w-4" /> },
@@ -1272,6 +1301,45 @@ function App() {
 
                   <Card className="border-white/10 bg-[#1f2740]/80 shadow-xl">
                     <CardHeader>
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="min-w-0">
+                          <CardTitle className="text-slate-100">tcpraw addon</CardTitle>
+                          <CardDescription className="text-slate-400">
+                            When a 6-digit code is copied to the clipboard, a quick-action button appears in the
+                            terminal status bar to run <span className="font-mono text-slate-300">tcpraw get &lt;code&gt;</span>.
+                          </CardDescription>
+                        </div>
+                        <button
+                          type="button"
+                          aria-label="Toggle tcpraw addon"
+                          onClick={() => {
+                            setTcprawEnabled((v) => {
+                              const next = !v;
+                              try {
+                                localStorage.setItem(TCPRAW_ENABLED_KEY, next ? "1" : "0");
+                              } catch {
+                                // ignore
+                              }
+                              if (!next) setTcprawCode(null);
+                              return next;
+                            });
+                          }}
+                          className={`relative h-6 w-11 shrink-0 rounded-full transition ${
+                            tcprawEnabled ? "bg-sky-500" : "bg-slate-600"
+                          }`}
+                        >
+                          <span
+                            className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition ${
+                              tcprawEnabled ? "left-[22px]" : "left-0.5"
+                            }`}
+                          />
+                        </button>
+                      </div>
+                    </CardHeader>
+                  </Card>
+
+                  <Card className="border-white/10 bg-[#1f2740]/80 shadow-xl">
+                    <CardHeader>
                       <div className="flex items-center justify-between">
                         <div>
                           <CardTitle className="text-slate-100">SFTP</CardTitle>
@@ -1714,6 +1782,22 @@ function App() {
                     : "Host details unavailable"}
                 </span>
                 <div className="flex shrink-0 items-center gap-3">
+                  {tcprawEnabled && tcprawCode ? (
+                    <button
+                      type="button"
+                      title={`Run: tcpraw get ${tcprawCode}`}
+                      className="flex items-center gap-1.5 rounded border border-sky-500/40 bg-sky-500/15 px-2 py-0.5 text-[10px] font-medium text-sky-200 transition hover:bg-sky-500/30 active:scale-95"
+                      onClick={() => {
+                        if (!activeTab.sessionId) return;
+                        void invoke("ssh_send_input", {
+                          sessionId: activeTab.sessionId,
+                          input: `tcpraw get ${tcprawCode}\r`,
+                        });
+                      }}
+                    >
+                      tcpraw get <span className="font-mono tracking-widest">{tcprawCode}</span>
+                    </button>
+                  ) : null}
                   {hostMetricsLoading && !hostMetrics && !hostMetricsError ? (
                     <span className="text-slate-500">Fetching host metrics…</span>
                   ) : null}

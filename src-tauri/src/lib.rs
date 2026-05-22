@@ -4,10 +4,10 @@ mod vault;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use ssh2::{KeyboardInteractivePrompt, Prompt, Session};
+use ssh2::{KeyboardInteractivePrompt, MethodType, Prompt, Session};
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -115,6 +115,94 @@ fn emit_progress(app: &AppHandle, line: impl Into<String>) {
     println!("[ssh] progress {}", line);
 }
 
+fn apply_handshake_profile(session: &Session, profile: usize) {
+    // Profile 0: libssh2 defaults.
+    if profile == 0 {
+        return;
+    }
+    if profile == 1 {
+        // Explicit modern preferences. Some OpenSSH configs can negotiate better
+        // when the client advertises a clear modern list.
+        let _ = session.method_pref(
+            MethodType::Kex,
+            "curve25519-sha256,curve25519-sha256@libssh.org,ecdh-sha2-nistp256,ecdh-sha2-nistp384,ecdh-sha2-nistp521,diffie-hellman-group14-sha256,diffie-hellman-group16-sha512,diffie-hellman-group14-sha1",
+        );
+        let _ = session.method_pref(
+            MethodType::HostKey,
+            "ssh-ed25519,rsa-sha2-512,rsa-sha2-256,ecdsa-sha2-nistp256,ssh-rsa",
+        );
+        let _ = session.method_pref(
+            MethodType::CryptCs,
+            "chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes128-ctr,aes256-cbc,aes128-cbc",
+        );
+        let _ = session.method_pref(
+            MethodType::CryptSc,
+            "chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes128-ctr,aes256-cbc,aes128-cbc",
+        );
+        let _ = session.method_pref(
+            MethodType::MacCs,
+            "hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,hmac-sha2-256,hmac-sha1",
+        );
+        let _ = session.method_pref(
+            MethodType::MacSc,
+            "hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,hmac-sha2-256,hmac-sha1",
+        );
+        let _ = session.method_pref(MethodType::CompCs, "none,zlib@openssh.com,zlib");
+        let _ = session.method_pref(MethodType::CompSc, "none,zlib@openssh.com,zlib");
+        return;
+    }
+    // Profile 2: compatibility-focused fallback for older / stricter servers.
+    let _ = session.method_pref(
+        MethodType::Kex,
+        "ecdh-sha2-nistp256,ecdh-sha2-nistp384,ecdh-sha2-nistp521,curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group14-sha1,diffie-hellman-group14-sha256,diffie-hellman-group-exchange-sha256",
+    );
+    let _ = session.method_pref(
+        MethodType::HostKey,
+        "rsa-sha2-512,rsa-sha2-256,ssh-rsa,ssh-ed25519,ecdsa-sha2-nistp256",
+    );
+    let _ = session.method_pref(
+        MethodType::CryptCs,
+        "aes256-ctr,aes128-ctr,aes256-cbc,aes128-cbc,chacha20-poly1305@openssh.com",
+    );
+    let _ = session.method_pref(
+        MethodType::CryptSc,
+        "aes256-ctr,aes192-ctr,aes128-ctr,chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-cbc,aes128-cbc",
+    );
+    let _ = session.method_pref(
+        MethodType::MacCs,
+        "hmac-sha2-256,hmac-sha2-512,hmac-sha1,hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com",
+    );
+    let _ = session.method_pref(
+        MethodType::MacSc,
+        "hmac-sha2-256,hmac-sha2-512,hmac-sha1,hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com",
+    );
+    let _ = session.method_pref(MethodType::CompCs, "none,zlib@openssh.com,zlib");
+    let _ = session.method_pref(MethodType::CompSc, "none,zlib@openssh.com,zlib");
+}
+
+fn tcp_connect_with_timeout(host: &str, port: u16, timeout: Duration) -> Result<TcpStream> {
+    let mut last_err: Option<std::io::Error> = None;
+    let addrs: Vec<_> = (host, port)
+        .to_socket_addrs()
+        .with_context(|| format!("DNS resolve failed for {host}:{port}"))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(anyhow::anyhow!("DNS resolve returned no addresses for {host}:{port}"));
+    }
+    for addr in addrs {
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(tcp) => return Ok(tcp),
+            Err(err) => last_err = Some(err),
+        }
+    }
+    Err(anyhow::anyhow!(
+        "TCP connect failed to {host}:{port} (host unreachable / blocked port / wrong address / timeout): {}",
+        last_err
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "unknown network error".to_string())
+    ))
+}
+
 fn connect_ssh<F: Fn(&str)>(req: &SshConnectRequest, progress: F) -> Result<Session> {
     println!(
         "[ssh] connect start host={} port={} user={} auth={}",
@@ -123,33 +211,26 @@ fn connect_ssh<F: Fn(&str)>(req: &SshConnectRequest, progress: F) -> Result<Sess
         req.username,
         if req.private_key.is_some() { "key" } else { "password" }
     );
-    // Use default libssh2 algorithm lists (same path as our SFTP connector). We previously
-    // set method_pref; an incorrect list can make handshake fail with "Unable to exchange
-    // encryption keys" even on modern OpenSSH servers.
     progress(&format!(
         "TCP: opening socket to {}:{}…",
         req.host, req.port
     ));
     let mut handshake_error: Option<anyhow::Error> = None;
     let mut session: Option<Session> = None;
-    for attempt in 1..=3 {
+    for attempt in 1_usize..=3 {
         if attempt > 1 {
             progress(&format!(
                 "SSH: handshake failed, new TCP attempt {}/3…",
                 attempt
             ));
         }
-        let tcp = TcpStream::connect((req.host.as_str(), req.port)).with_context(|| {
-            format!(
-                "TCP connect failed to {}:{} (host unreachable / blocked port / wrong address)",
-                req.host, req.port
-            )
-        })?;
+        let tcp = tcp_connect_with_timeout(&req.host, req.port, Duration::from_secs(8))?;
         let _ = tcp.set_read_timeout(Some(Duration::from_secs(15)));
         let _ = tcp.set_write_timeout(Some(Duration::from_secs(15)));
         progress("TCP: connected.");
         progress("SSH: creating libssh2 session…");
         let mut s = Session::new().context("Failed to create SSH session")?;
+        apply_handshake_profile(&s, attempt.saturating_sub(1));
         s.set_tcp_stream(tcp);
         progress("SSH: key exchange / protocol handshake (KEX)…");
         match s.handshake() {
@@ -304,18 +385,28 @@ fn now_ms() -> u64 {
 }
 
 #[tauri::command]
-fn ssh_test_connection(req: SshConnectRequest) -> Result<String, String> {
+async fn ssh_test_connection(req: SshConnectRequest) -> Result<String, String> {
     println!(
         "[ssh] test connection requested host={} port={} user={}",
         req.host, req.port, req.username
     );
-    connect_ssh(&req, |_| {})
+    let req_for_connect = SshConnectRequest {
+        host: req.host.clone(),
+        port: req.port,
+        username: req.username.clone(),
+        password: req.password.clone(),
+        private_key: req.private_key.clone(),
+        passphrase: req.passphrase.clone(),
+    };
+    tauri::async_runtime::spawn_blocking(move || connect_ssh(&req_for_connect, |_| {}))
+        .await
+        .map_err(|e| format!("Connection worker thread failed: {e}"))?
         .map(|_| format!("Connected to {}@{}:{}", req.username, req.host, req.port))
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn ssh_start_shell(
+async fn ssh_start_shell(
     app: AppHandle,
     req: SshShellRequest,
     sessions: State<'_, ShellSessions>,
@@ -333,8 +424,12 @@ fn ssh_start_shell(
         passphrase: req.passphrase.clone(),
     };
     let app_for_progress = app.clone();
-    let session = connect_ssh(&connect_req, |line| emit_progress(&app_for_progress, line))
-        .map_err(|e| e.to_string())?;
+    let session = tauri::async_runtime::spawn_blocking(move || {
+        connect_ssh(&connect_req, |line| emit_progress(&app_for_progress, line))
+    })
+    .await
+    .map_err(|e| format!("SSH connect worker thread failed: {e}"))?
+    .map_err(|e| e.to_string())?;
     let session = session;
     session.set_keepalive(true, 20);
     emit_progress(&app, "Shell: opening session channel…");

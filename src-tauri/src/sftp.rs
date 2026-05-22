@@ -4,7 +4,7 @@ use ssh2::{OpenFlags, OpenType, Session};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -115,12 +115,7 @@ fn now_ms() -> u64 {
 }
 
 fn connect(req: &SftpConnectRequest) -> Result<Session> {
-    let tcp = TcpStream::connect((req.host.as_str(), req.port)).with_context(|| {
-        format!(
-            "TCP connect failed to {}:{} (host unreachable / blocked port / wrong address)",
-            req.host, req.port
-        )
-    })?;
+    let tcp = tcp_connect_with_timeout(&req.host, req.port, Duration::from_secs(8))?;
     let _ = tcp.set_read_timeout(Some(Duration::from_secs(30)));
     let _ = tcp.set_write_timeout(Some(Duration::from_secs(30)));
     let mut session = Session::new().context("Failed to create SSH session")?;
@@ -154,6 +149,29 @@ fn connect(req: &SftpConnectRequest) -> Result<Session> {
     Ok(session)
 }
 
+fn tcp_connect_with_timeout(host: &str, port: u16, timeout: Duration) -> Result<TcpStream> {
+    let mut last_err: Option<std::io::Error> = None;
+    let addrs: Vec<_> = (host, port)
+        .to_socket_addrs()
+        .with_context(|| format!("DNS resolve failed for {host}:{port}"))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(anyhow::anyhow!("DNS resolve returned no addresses for {host}:{port}"));
+    }
+    for addr in addrs {
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(tcp) => return Ok(tcp),
+            Err(err) => last_err = Some(err),
+        }
+    }
+    Err(anyhow::anyhow!(
+        "TCP connect failed to {host}:{port} (host unreachable / blocked port / wrong address / timeout): {}",
+        last_err
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "unknown network error".to_string())
+    ))
+}
+
 fn normalize(path: &str) -> String {
     if path.is_empty() {
         "/".to_string()
@@ -163,7 +181,7 @@ fn normalize(path: &str) -> String {
 }
 
 #[tauri::command]
-pub fn sftp_connect(
+pub async fn sftp_connect(
     req: SftpConnectRequest,
     sessions: State<'_, SftpSessions>,
 ) -> Result<SftpConnectResponse, String> {
@@ -171,13 +189,26 @@ pub fn sftp_connect(
         "[sftp] connect requested host={} port={} user={}",
         req.host, req.port, req.username
     );
-    let session = connect(&req).map_err(|e| e.to_string())?;
-    let sftp = session.sftp().map_err(|e| e.to_string())?;
-    let home = match sftp.realpath(Path::new(".")) {
-        Ok(p) => p.to_string_lossy().to_string(),
-        Err(_) => "/".to_string(),
+    let req_for_connect = SftpConnectRequest {
+        host: req.host.clone(),
+        port: req.port,
+        username: req.username.clone(),
+        password: req.password.clone(),
+        private_key: req.private_key.clone(),
+        passphrase: req.passphrase.clone(),
     };
-    drop(sftp);
+    let (session, home) = tauri::async_runtime::spawn_blocking(move || {
+        let session = connect(&req_for_connect)?;
+        let sftp = session.sftp().map_err(anyhow::Error::from)?;
+        let home = match sftp.realpath(Path::new(".")) {
+            Ok(p) => p.to_string_lossy().to_string(),
+            Err(_) => "/".to_string(),
+        };
+        Ok::<(Session, String), anyhow::Error>((session, home))
+    })
+    .await
+    .map_err(|e| format!("SFTP connect worker thread failed: {e}"))?
+    .map_err(|e| e.to_string())?;
 
     let id = sessions.create_id();
     println!("[sftp] session allocated id={} home={}", id, home);
