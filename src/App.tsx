@@ -34,7 +34,7 @@ import {
   TerminalView,
   type TerminalKeywordSettings,
 } from "@/components/terminal-view";
-import { SftpView } from "@/components/sftp-view";
+import { SftpView, clearSftpSessionCache } from "@/components/sftp-view";
 import { TitleBar } from "@/components/title-bar";
 import { VaultOverlay } from "@/components/vault-overlay";
 import {
@@ -255,12 +255,25 @@ function App() {
   const PRIVACY_REDACT_HOSTS_KEY = "rsshu.settings.privacyRedactHosts";
   const TERMINAL_HOST_INFO_BAR_KEY = "rsshu.settings.terminalHostInfoBar";
   const TCPRAW_ENABLED_KEY = "rsshu.settings.tcprawEnabled";
+  const QUICK_NAV_KEY_STORAGE = "rsshu.settings.quickNavKey";
+  const CONNECT_COUNTS_KEY = "rsshu.connectCounts";
   const [sftpHideDotfiles, setSftpHideDotfiles] = useState(false);
   const [sftpOpenEditMode, setSftpOpenEditMode] = useState<"auto" | "confirm">("auto");
   const [privacyRedactHosts, setPrivacyRedactHosts] = useState(false);
   const [showTerminalHostInfoBar, setShowTerminalHostInfoBar] = useState(true);
   const [tcprawEnabled, setTcprawEnabled] = useState(false);
   const [tcprawCode, setTcprawCode] = useState<string | null>(null);
+  const [quickNavKey, setQuickNavKey] = useState("F2");
+  const [capturingKey, setCapturingKey] = useState(false);
+  const [connectCounts, setConnectCounts] = useState<Record<string, { ssh: number; sftp: number }>>(
+    () => {
+      try {
+        const raw = localStorage.getItem(CONNECT_COUNTS_KEY);
+        if (raw) return JSON.parse(raw) as Record<string, { ssh: number; sftp: number }>;
+      } catch { /* ignore */ }
+      return {};
+    },
+  );
   const [hostMetrics, setHostMetrics] = useState<SshHostMetricsResponse | null>(null);
   const [hostMetricsLoading, setHostMetricsLoading] = useState(false);
   const [hostMetricsError, setHostMetricsError] = useState("");
@@ -305,6 +318,15 @@ function App() {
     try {
       const v = localStorage.getItem(TCPRAW_ENABLED_KEY);
       if (v === "1" || v === "true") setTcprawEnabled(true);
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      const v = localStorage.getItem(QUICK_NAV_KEY_STORAGE);
+      if (v) setQuickNavKey(v);
     } catch {
       // ignore
     }
@@ -472,6 +494,7 @@ function App() {
       } catch {
         // best-effort
       }
+      clearSftpSessionCache(sftpSession.sessionId, sftpSession.hostId);
     }
     for (const tab of tabs) {
       if (!tab.sessionId) continue;
@@ -642,6 +665,114 @@ function App() {
     return () => window.clearInterval(poll);
   }, [tcprawEnabled, screen, terminalState, activeTab?.sessionId]);
 
+  // Build a "Ctrl+Alt+X"-style label from a KeyboardEvent.
+  function buildKeyCombo(e: KeyboardEvent): string {
+    const parts: string[] = [];
+    if (e.ctrlKey) parts.push("Ctrl");
+    if (e.altKey) parts.push("Alt");
+    if (e.metaKey) parts.push("Meta");
+    if (e.shiftKey) parts.push("Shift");
+    if (!["Control", "Alt", "Shift", "Meta"].includes(e.key)) parts.push(e.key);
+    return parts.join("+");
+  }
+
+  // Build a "Mouse4"-style label from a MouseEvent (extra buttons only).
+  function buildMouseCombo(e: MouseEvent): string {
+    return `Mouse${e.button}`;
+  }
+
+  // Whether the stored shortcut is a mouse-button binding.
+  function isMouseCombo(combo: string): boolean {
+    return combo.startsWith("Mouse");
+  }
+
+  // Quick-capture: grab the next keydown or extra mousedown and save as shortcut.
+  useEffect(() => {
+    if (!capturingKey) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (["Control", "Alt", "Shift", "Meta"].includes(e.key)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const combo = buildKeyCombo(e);
+      setQuickNavKey(combo);
+      try { localStorage.setItem(QUICK_NAV_KEY_STORAGE, combo); } catch { /* ignore */ }
+      setCapturingKey(false);
+    };
+    const onMouse = (e: MouseEvent) => {
+      // Only capture extra buttons (≥ 3); leave left/right/middle alone.
+      if (e.button < 3) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const combo = buildMouseCombo(e);
+      setQuickNavKey(combo);
+      try { localStorage.setItem(QUICK_NAV_KEY_STORAGE, combo); } catch { /* ignore */ }
+      setCapturingKey(false);
+    };
+    window.addEventListener("keydown", onKey, { capture: true });
+    window.addEventListener("mousedown", onMouse, { capture: true });
+    return () => {
+      window.removeEventListener("keydown", onKey, { capture: true });
+      window.removeEventListener("mousedown", onMouse, { capture: true });
+    };
+  }, [capturingKey]);
+
+  // Global quick-nav: cycle terminal ↔ SFTP, triggered by key or extra mouse button.
+  useEffect(() => {
+    if (vaultStatus !== "unlocked") return;
+    const navigate = () => {
+      if (screen === "terminal") {
+        setScreen("sftp");
+      } else if (tabs.length > 0) {
+        setScreen("terminal");
+        if (!activeTab?.sessionId || activeTab.disconnected) {
+          setTerminalState("disconnected");
+        } else {
+          setTerminalState("connected");
+        }
+      } else {
+        setScreen("sftp");
+      }
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (isMouseCombo(quickNavKey)) return;
+      if (buildKeyCombo(e) !== quickNavKey) return;
+      const tag = (document.activeElement as HTMLElement | null)?.tagName ?? "";
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+      e.preventDefault();
+      navigate();
+    };
+    const onMouse = (e: MouseEvent) => {
+      if (!isMouseCombo(quickNavKey)) return;
+      if (buildMouseCombo(e) !== quickNavKey) return;
+      e.preventDefault();
+      navigate();
+    };
+    window.addEventListener("keydown", onKey);
+    window.addEventListener("mousedown", onMouse);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("mousedown", onMouse);
+    };
+  }, [vaultStatus, quickNavKey, screen, tabs, activeTab]);
+
+  function bumpCount(hostId: string, type: "ssh" | "sftp") {
+    setConnectCounts((prev) => {
+      const cur = prev[hostId] ?? { ssh: 0, sftp: 0 };
+      const next = { ...prev, [hostId]: { ...cur, [type]: cur[type] + 1 } };
+      try { localStorage.setItem(CONNECT_COUNTS_KEY, JSON.stringify(next)); } catch { /* ignore */ }
+      return next;
+    });
+  }
+
+  const topHosts = useMemo(() => {
+    return hosts
+      .map((h) => ({ host: h, total: (connectCounts[h.id]?.ssh ?? 0) + (connectCounts[h.id]?.sftp ?? 0) }))
+      .filter(({ total }) => total > 0)
+      .sort((a, b) => b.total - a.total)
+      .slice(0, 3)
+      .map(({ host }) => host);
+  }, [hosts, connectCounts]);
+
   const sidebarItems: Array<{ key: SidebarSection; label: string; icon: ReactNode }> = [
     { key: "hosts", label: "Hosts", icon: <Server className="h-4 w-4" /> },
     { key: "keychain", label: "Keychain", icon: <KeyRound className="h-4 w-4" /> },
@@ -718,6 +849,12 @@ function App() {
     setHostStatuses((prev) => {
       const next = { ...prev };
       delete next[hostId];
+      return next;
+    });
+    setConnectCounts((prev) => {
+      const next = { ...prev };
+      delete next[hostId];
+      try { localStorage.setItem(CONNECT_COUNTS_KEY, JSON.stringify(next)); } catch { /* ignore */ }
       return next;
     });
   }
@@ -842,6 +979,7 @@ function App() {
   }
 
   async function connectHost(host: Host) {
+    bumpCount(host.id, "ssh");
     setScreen("terminal");
     await startShellForHost(host, null);
   }
@@ -855,6 +993,7 @@ function App() {
   }
 
   async function openSftpForHost(host: Host) {
+    bumpCount(host.id, "sftp");
     if (sftpSession) {
       try {
         await invoke("sftp_disconnect", { sessionId: sftpSession.sessionId });
@@ -900,6 +1039,7 @@ function App() {
     } catch {
       // best-effort
     }
+    clearSftpSessionCache(sftpSession.sessionId, sftpSession.hostId);
     setSftpSession(null);
     setSftpState("empty");
   }
@@ -1161,6 +1301,47 @@ function App() {
                 </>
               ) : sidebarSection === "settings" ? (
                 <div className="max-w-2xl space-y-4">
+                  <Card className="border-white/10 bg-[#1f2740]/80 shadow-xl">
+                    <CardHeader>
+                      <CardTitle className="text-slate-100">Quick navigation shortcut</CardTitle>
+                      <CardDescription className="text-slate-400">
+                        Press this key anywhere in the app to jump between Terminal and SFTP.
+                        If no terminal tab is open, pressing it will switch to SFTP.
+                      </CardDescription>
+                    </CardHeader>
+                    <CardContent>
+                      <div className="flex items-center gap-3">
+                        <kbd className="inline-flex min-w-[2.5rem] items-center justify-center rounded border border-white/20 bg-white/[0.06] px-2.5 py-1 font-mono text-sm text-slate-100 shadow-sm">
+                          {quickNavKey}
+                        </kbd>
+                        {capturingKey ? (
+                          <span className="animate-pulse text-sm text-amber-300">Press any key…</span>
+                        ) : (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() => setCapturingKey(true)}
+                          >
+                            Change
+                          </Button>
+                        )}
+                        {capturingKey ? (
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            onClick={() => setCapturingKey(false)}
+                          >
+                            Cancel
+                          </Button>
+                        ) : null}
+                      </div>
+                      <p className="mt-2 text-xs text-slate-500">
+                        On Terminal → switches to SFTP. On any other screen → switches to Terminal.
+                        Supports keyboard keys, combos (e.g. Ctrl+F2) and extra mouse buttons (Mouse3 and above).
+                      </p>
+                    </CardContent>
+                  </Card>
+
                   <Card className="border-white/10 bg-[#1f2740]/80 shadow-xl">
                     <CardHeader>
                       <div className="flex items-center justify-between">
@@ -1550,15 +1731,38 @@ function App() {
         <section className="relative flex min-h-0 flex-1 overflow-hidden">
           {sftpState === "empty" ? (
             <div className="flex flex-1 items-center justify-center bg-[#050912]">
-              <div className="flex flex-col items-center gap-2 text-center">
+              <div className="flex flex-col items-center gap-4 text-center">
                 <div className="flex h-10 w-10 items-center justify-center rounded-full bg-white/5 text-slate-400">
                   <FolderOpen className="h-5 w-5" />
                 </div>
-                <p className="text-sm text-slate-300">No SFTP session</p>
-                <p className="text-xs text-slate-500">Browse files on a remote server.</p>
-                <Button size="sm" variant="outline" className="mt-2" onClick={() => setScreen("hosts")}>
+                <div>
+                  <p className="text-sm text-slate-300">No SFTP session</p>
+                  <p className="text-xs text-slate-500">Browse files on a remote server.</p>
+                </div>
+                {topHosts.length > 0 ? (
+                  <div className="w-full min-w-[260px] max-w-xs space-y-2">
+                    <p className="text-[10px] uppercase tracking-wider text-slate-500">Quick connect</p>
+                    {topHosts.map((host) => (
+                      <div key={host.id} className="flex items-center justify-between gap-2 rounded-md border border-white/10 bg-white/[0.04] px-3 py-2">
+                        <div className="min-w-0 text-left">
+                          <p className="truncate text-xs font-medium text-slate-200">{host.name}</p>
+                          <p className="truncate text-[10px] text-slate-500">{host.username}@{host.host}:{host.port}</p>
+                        </div>
+                        <div className="flex shrink-0 gap-1.5">
+                          <Button size="sm" variant="outline" className="h-7 px-2 text-[10px]" onClick={() => void openSftpForHost(host)}>
+                            <FolderOpen className="mr-1 h-3 w-3" />SFTP
+                          </Button>
+                          <Button size="sm" className="h-7 px-2 text-[10px]" onClick={() => void connectHost(host)}>
+                            <Terminal className="mr-1 h-3 w-3" />SSH
+                          </Button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+                <Button size="sm" variant="outline" onClick={() => setScreen("hosts")}>
                   <Server className="mr-1.5 h-3.5 w-3.5" />
-                  Pick a host
+                  All hosts
                 </Button>
               </div>
             </div>
@@ -1579,6 +1783,7 @@ function App() {
           {sftpState === "connected" && sftpSession ? (
             <SftpView
               sessionId={sftpSession.sessionId}
+              hostId={sftpSession.hostId}
               home={sftpSession.home}
               hostLabel={formatSftpBannerLabel(
                 hosts.find((h) => h.id === sftpSession.hostId),
@@ -1680,15 +1885,38 @@ function App() {
       <section className="relative flex min-h-0 flex-1 overflow-hidden">
         {terminalState === "empty" ? (
           <div className="flex flex-1 items-center justify-center bg-[#050912]">
-            <div className="flex flex-col items-center gap-2 text-center">
+            <div className="flex flex-col items-center gap-4 text-center">
               <div className="flex h-10 w-10 items-center justify-center rounded-full bg-white/5 text-slate-400">
                 <Terminal className="h-5 w-5" />
               </div>
-              <p className="text-sm text-slate-300">No active session</p>
-              <p className="text-xs text-slate-500">Pick a host to open a terminal.</p>
-              <Button size="sm" variant="outline" className="mt-2" onClick={() => setScreen("hosts")}>
+              <div>
+                <p className="text-sm text-slate-300">No active session</p>
+                <p className="text-xs text-slate-500">Pick a host to open a terminal.</p>
+              </div>
+              {topHosts.length > 0 ? (
+                <div className="w-full min-w-[260px] max-w-xs space-y-2">
+                  <p className="text-[10px] uppercase tracking-wider text-slate-500">Quick connect</p>
+                  {topHosts.map((host) => (
+                    <div key={host.id} className="flex items-center justify-between gap-2 rounded-md border border-white/10 bg-white/[0.04] px-3 py-2">
+                      <div className="min-w-0 text-left">
+                        <p className="truncate text-xs font-medium text-slate-200">{host.name}</p>
+                        <p className="truncate text-[10px] text-slate-500">{host.username}@{host.host}:{host.port}</p>
+                      </div>
+                      <div className="flex shrink-0 gap-1.5">
+                        <Button size="sm" variant="outline" className="h-7 px-2 text-[10px]" onClick={() => void openSftpForHost(host)}>
+                          <FolderOpen className="mr-1 h-3 w-3" />SFTP
+                        </Button>
+                        <Button size="sm" className="h-7 px-2 text-[10px]" onClick={() => void connectHost(host)}>
+                          <Terminal className="mr-1 h-3 w-3" />SSH
+                        </Button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+              <Button size="sm" variant="outline" onClick={() => setScreen("hosts")}>
                 <Server className="mr-1.5 h-3.5 w-3.5" />
-                Go to Hosts
+                All hosts
               </Button>
             </div>
           </div>

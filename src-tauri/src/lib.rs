@@ -1,20 +1,20 @@
 mod sftp;
+mod ssh_client;
 mod sync;
 mod vault;
 
 use anyhow::{Context, Result};
+use russh::ChannelMsg;
 use serde::{Deserialize, Serialize};
-use ssh2::{KeyboardInteractivePrompt, MethodType, Prompt, Session};
+use ssh_client::{SshConnectParams, SshHandle};
 use std::collections::HashMap;
-use std::io::{ErrorKind, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
+use tokio::sync::Mutex as AsyncMutex;
 use std::thread;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
-use tempfile::NamedTempFile;
 
 use sftp::SftpSessions;
 use sync::SyncState;
@@ -22,49 +22,6 @@ use vault::Vault;
 
 /// Shell/SFTP sessions with no activity for this long are closed by background cleanup.
 const IDLE_SESSION_MAX_MS: u64 = 2 * 60 * 60 * 1000;
-
-/// Many OpenSSH+PAM setups disable the `password` auth method and only accept
-/// `keyboard-interactive` (same password, different SSH message). Try both.
-struct PasswordKeyboardInteractive<'a> {
-    password: &'a str,
-}
-
-impl KeyboardInteractivePrompt for PasswordKeyboardInteractive<'_> {
-    fn prompt<'b>(
-        &mut self,
-        _username: &str,
-        _instructions: &str,
-        prompts: &[Prompt<'b>],
-    ) -> Vec<String> {
-        prompts
-            .iter()
-            .map(|_| self.password.to_string())
-            .collect()
-    }
-}
-
-pub(crate) fn authenticate_password_fallback_session(
-    session: &Session,
-    username: &str,
-    password: &str,
-    before_keyboard_interactive: impl FnOnce(),
-) -> Result<()> {
-    let _ = session.userauth_password(username, password);
-    if session.authenticated() {
-        return Ok(());
-    }
-    before_keyboard_interactive();
-    let mut kbd = PasswordKeyboardInteractive { password };
-    session
-        .userauth_keyboard_interactive(username, &mut kbd)
-        .context("SSH keyboard-interactive authentication failed")?;
-    if !session.authenticated() {
-        return Err(anyhow::anyhow!(
-            "SSH authentication did not complete after password and keyboard-interactive attempts"
-        ));
-    }
-    Ok(())
-}
 
 #[derive(Debug, Deserialize)]
 struct SshConnectRequest {
@@ -115,95 +72,21 @@ fn emit_progress(app: &AppHandle, line: impl Into<String>) {
     println!("[ssh] progress {}", line);
 }
 
-fn apply_handshake_profile(session: &Session, profile: usize) {
-    // Profile 0: libssh2 defaults.
-    if profile == 0 {
-        return;
+fn ssh_connect_params(req: &SshConnectRequest) -> SshConnectParams {
+    SshConnectParams {
+        host: req.host.clone(),
+        port: req.port,
+        username: req.username.clone(),
+        password: req.password.clone(),
+        private_key: req.private_key.clone(),
+        passphrase: req.passphrase.clone(),
     }
-    if profile == 1 {
-        // Explicit modern preferences. Some OpenSSH configs can negotiate better
-        // when the client advertises a clear modern list.
-        let _ = session.method_pref(
-            MethodType::Kex,
-            "curve25519-sha256,curve25519-sha256@libssh.org,ecdh-sha2-nistp256,ecdh-sha2-nistp384,ecdh-sha2-nistp521,diffie-hellman-group14-sha256,diffie-hellman-group16-sha512,diffie-hellman-group14-sha1",
-        );
-        let _ = session.method_pref(
-            MethodType::HostKey,
-            "ssh-ed25519,rsa-sha2-512,rsa-sha2-256,ecdsa-sha2-nistp256,ssh-rsa",
-        );
-        let _ = session.method_pref(
-            MethodType::CryptCs,
-            "chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes128-ctr,aes256-cbc,aes128-cbc",
-        );
-        let _ = session.method_pref(
-            MethodType::CryptSc,
-            "chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes128-ctr,aes256-cbc,aes128-cbc",
-        );
-        let _ = session.method_pref(
-            MethodType::MacCs,
-            "hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,hmac-sha2-256,hmac-sha1",
-        );
-        let _ = session.method_pref(
-            MethodType::MacSc,
-            "hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,hmac-sha2-256,hmac-sha1",
-        );
-        let _ = session.method_pref(MethodType::CompCs, "none,zlib@openssh.com,zlib");
-        let _ = session.method_pref(MethodType::CompSc, "none,zlib@openssh.com,zlib");
-        return;
-    }
-    // Profile 2: compatibility-focused fallback for older / stricter servers.
-    let _ = session.method_pref(
-        MethodType::Kex,
-        "ecdh-sha2-nistp256,ecdh-sha2-nistp384,ecdh-sha2-nistp521,curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group14-sha1,diffie-hellman-group14-sha256,diffie-hellman-group-exchange-sha256",
-    );
-    let _ = session.method_pref(
-        MethodType::HostKey,
-        "rsa-sha2-512,rsa-sha2-256,ssh-rsa,ssh-ed25519,ecdsa-sha2-nistp256",
-    );
-    let _ = session.method_pref(
-        MethodType::CryptCs,
-        "aes256-ctr,aes128-ctr,aes256-cbc,aes128-cbc,chacha20-poly1305@openssh.com",
-    );
-    let _ = session.method_pref(
-        MethodType::CryptSc,
-        "aes256-ctr,aes192-ctr,aes128-ctr,chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-cbc,aes128-cbc",
-    );
-    let _ = session.method_pref(
-        MethodType::MacCs,
-        "hmac-sha2-256,hmac-sha2-512,hmac-sha1,hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com",
-    );
-    let _ = session.method_pref(
-        MethodType::MacSc,
-        "hmac-sha2-256,hmac-sha2-512,hmac-sha1,hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com",
-    );
-    let _ = session.method_pref(MethodType::CompCs, "none,zlib@openssh.com,zlib");
-    let _ = session.method_pref(MethodType::CompSc, "none,zlib@openssh.com,zlib");
 }
 
-fn tcp_connect_with_timeout(host: &str, port: u16, timeout: Duration) -> Result<TcpStream> {
-    let mut last_err: Option<std::io::Error> = None;
-    let addrs: Vec<_> = (host, port)
-        .to_socket_addrs()
-        .with_context(|| format!("DNS resolve failed for {host}:{port}"))?
-        .collect();
-    if addrs.is_empty() {
-        return Err(anyhow::anyhow!("DNS resolve returned no addresses for {host}:{port}"));
-    }
-    for addr in addrs {
-        match TcpStream::connect_timeout(&addr, timeout) {
-            Ok(tcp) => return Ok(tcp),
-            Err(err) => last_err = Some(err),
-        }
-    }
-    Err(anyhow::anyhow!(
-        "TCP connect failed to {host}:{port} (host unreachable / blocked port / wrong address / timeout): {}",
-        last_err
-            .map(|e| e.to_string())
-            .unwrap_or_else(|| "unknown network error".to_string())
-    ))
-}
-
-fn connect_ssh<F: Fn(&str)>(req: &SshConnectRequest, progress: F) -> Result<Session> {
+fn connect_ssh<F: Fn(&str) + Send + Sync + 'static>(
+    req: &SshConnectRequest,
+    progress: F,
+) -> Result<SshHandle> {
     println!(
         "[ssh] connect start host={} port={} user={} auth={}",
         req.host,
@@ -215,99 +98,66 @@ fn connect_ssh<F: Fn(&str)>(req: &SshConnectRequest, progress: F) -> Result<Sess
         "TCP: opening socket to {}:{}…",
         req.host, req.port
     ));
-    let mut handshake_error: Option<anyhow::Error> = None;
-    let mut session: Option<Session> = None;
-    for attempt in 1_usize..=3 {
-        if attempt > 1 {
-            progress(&format!(
-                "SSH: handshake failed, new TCP attempt {}/3…",
-                attempt
-            ));
-        }
-        let tcp = tcp_connect_with_timeout(&req.host, req.port, Duration::from_secs(8))?;
-        let _ = tcp.set_read_timeout(Some(Duration::from_secs(15)));
-        let _ = tcp.set_write_timeout(Some(Duration::from_secs(15)));
-        progress("TCP: connected.");
-        progress("SSH: creating libssh2 session…");
-        let mut s = Session::new().context("Failed to create SSH session")?;
-        apply_handshake_profile(&s, attempt.saturating_sub(1));
-        s.set_tcp_stream(tcp);
-        progress("SSH: key exchange / protocol handshake (KEX)…");
-        match s.handshake() {
-            Ok(_) => {
-                progress("SSH: handshake complete; transport encrypted.");
-                session = Some(s);
-                handshake_error = None;
-                break;
-            }
-            Err(err) => {
-                eprintln!(
-                    "[ssh] handshake attempt {}/3 failed host={} port={} err={}",
-                    attempt, req.host, req.port, err
-                );
-                handshake_error = Some(anyhow::anyhow!(err.to_string()));
-                if attempt < 3 {
-                    progress("SSH: waiting before handshake retry…");
-                    thread::sleep(Duration::from_millis(250));
-                }
-            }
-        }
-    }
-    if let Some(err) = handshake_error {
-        return Err(anyhow::anyhow!(
-            "SSH handshake failed for {}:{} after 3 attempts: {}. If SFTP in this app works for the same host, report this: default libssh2 negotiation should not fail on OpenSSH 10 with ed25519 host keys.",
-            req.host,
-            req.port,
-            err
-        ));
-    }
-    let session = session.context("SSH handshake missing session after success")?;
+    progress("SSH: connecting and negotiating…");
+    let params = ssh_connect_params(req);
 
-    if let Some(private_key) = &req.private_key {
-        progress("SSH: user authentication (public key)…");
-        let mut key_file = NamedTempFile::new().context("Failed to create key temp file")?;
-        key_file
-            .write_all(private_key.as_bytes())
-            .context("Failed to write private key temp file")?;
-        session
-            .userauth_pubkey_file(
-                &req.username,
-                None,
-                key_file.path(),
-                req.passphrase.as_deref(),
+    let progress = Arc::new(progress);
+    let key_auth = params.private_key.is_some();
+    let handle = ssh_client::block_on({
+        let progress = Arc::clone(&progress);
+        async move {
+            let config = std::sync::Arc::new(russh::client::Config {
+                inactivity_timeout: Some(Duration::from_secs(300)),
+                ..Default::default()
+            });
+            let mut handle = russh::client::connect(
+                config,
+                (params.host.as_str(), params.port),
+                ssh_client::SshClientHandler,
             )
-            .context("SSH key authentication failed. Verify key and passphrase.")?;
-    } else if let Some(password) = &req.password {
-        progress("SSH: user authentication (password)…");
-        authenticate_password_fallback_session(&session, &req.username, password, || {
-            progress("SSH: user authentication (keyboard-interactive)…");
-        })
-        .with_context(|| {
-            "SSH authentication failed. Verify username/password. (Plain password and keyboard-interactive were tried; many PAM setups only allow the latter.)"
-        })?;
-    } else {
-        return Err(anyhow::anyhow!(
-            "Password is required in this MVP build. Key auth can be added next."
-        ));
-    }
+            .await
+            .context("SSH connect failed")?;
 
-    if !session.authenticated() {
-        return Err(anyhow::anyhow!("SSH authentication did not complete"));
-    }
+            progress("SSH: handshake complete; authenticating…");
+            if params.private_key.is_some() {
+                progress("SSH: user authentication (public key)…");
+            } else if params.password.is_some() {
+                progress("SSH: user authentication (password)…");
+            }
+
+            if params.private_key.is_some() || params.password.is_some() {
+                ssh_client::authenticate_session(&mut handle, &params, || {
+                    progress("SSH: user authentication (keyboard-interactive)…");
+                })
+                .await?;
+            } else {
+                anyhow::bail!("Password or private key is required for SSH authentication");
+            }
+
+            Ok(handle)
+        }
+    })
+    .with_context(|| {
+        if key_auth {
+            "SSH key authentication failed. Verify key and passphrase."
+        } else {
+            "SSH authentication failed. Verify username/password. (Plain password and keyboard-interactive were tried; many PAM setups only allow the latter.)"
+        }
+    })?;
 
     progress("SSH: authenticated.");
     println!(
         "[ssh] auth success host={} user={}",
         req.host, req.username
     );
-    Ok(session)
+    Ok(handle)
 }
 
 struct ShellSession {
     command_tx: Sender<WorkerCommand>,
     output_rx: Receiver<String>,
     is_alive: Arc<AtomicBool>,
-    ssh_session: Arc<Mutex<Session>>,
+    ssh_session: Arc<AsyncMutex<SshHandle>>,
     last_touch_ms: Arc<AtomicU64>,
 }
 
@@ -370,9 +220,7 @@ impl ShellSessions {
         };
         for session in sessions {
             let _ = session.command_tx.send(WorkerCommand::Close);
-            if let Ok(ssh) = session.ssh_session.lock() {
-                let _ = ssh.disconnect(None, reason, None);
-            }
+            let _ = ssh_client::disconnect_session(Arc::clone(&session.ssh_session), reason);
         }
     }
 }
@@ -424,196 +272,145 @@ async fn ssh_start_shell(
         passphrase: req.passphrase.clone(),
     };
     let app_for_progress = app.clone();
-    let session = tauri::async_runtime::spawn_blocking(move || {
-        connect_ssh(&connect_req, |line| emit_progress(&app_for_progress, line))
+    let (handle, mut channel) = tauri::async_runtime::spawn_blocking(move || {
+        let app_connect = app_for_progress.clone();
+        let handle = connect_ssh(&connect_req, move |line| emit_progress(&app_connect, line))
+            .map_err(|e| e.to_string())?;
+        emit_progress(&app_for_progress, "Shell: opening session channel…");
+        ssh_client::block_on(async move {
+            let channel = handle
+                .channel_open_session()
+                .await
+                .map_err(|e| format!("Failed to open SSH channel: {e}"))?;
+            emit_progress(&app_for_progress, "Shell: requesting PTY (xterm)…");
+            channel
+                .request_pty(true, "xterm", 120, 40, 0, 0, &[])
+                .await
+                .map_err(|e| format!("Failed to request PTY: {e}"))?;
+            emit_progress(&app_for_progress, "Shell: starting interactive session…");
+            channel
+                .request_shell(true)
+                .await
+                .map_err(|e| format!("Failed to start shell: {e}"))?;
+            emit_progress(&app_for_progress, "Shell: ready.");
+            Ok::<_, String>((handle, channel))
+        })
     })
     .await
     .map_err(|e| format!("SSH connect worker thread failed: {e}"))?
     .map_err(|e| e.to_string())?;
-    let session = session;
-    session.set_keepalive(true, 20);
-    emit_progress(&app, "Shell: opening session channel…");
-    let mut channel = session
-        .channel_session()
-        .map_err(|e| format!("Failed to open SSH channel: {e}"))?;
-    emit_progress(&app, "Shell: requesting PTY (xterm)…");
-    channel
-        .request_pty("xterm", None, Some((120, 40, 0, 0)))
-        .map_err(|e| format!("Failed to request PTY: {e}"))?;
-    emit_progress(&app, "Shell: starting interactive session…");
-    channel
-        .shell()
-        .map_err(|e| format!("Failed to start shell: {e}"))?;
-    emit_progress(&app, "Shell: ready.");
 
     let (command_tx, command_rx) = mpsc::channel::<WorkerCommand>();
     let (output_tx, output_rx) = mpsc::channel::<String>();
     let is_alive = Arc::new(AtomicBool::new(true));
-    let shared_session = Arc::new(Mutex::new(session.clone()));
+    let shared_session = Arc::new(AsyncMutex::new(handle));
     let last_touch_ms = Arc::new(AtomicU64::new(now_ms()));
     let session_id = sessions.create_id();
     println!("[ssh] shell session allocated id={}", session_id);
     let worker_session_id = session_id.clone();
     let worker_alive = Arc::clone(&is_alive);
+    let worker_ssh = Arc::clone(&shared_session);
+    let worker_log_id = worker_session_id.clone();
 
     thread::spawn(move || {
         println!(
             "[ssh] worker thread started session_id={}",
             worker_session_id
         );
-        let session = session;
-        let mut channel = channel;
-        let mut buf = [0_u8; 8192];
-        let mut pending_input: Vec<u8> = Vec::new();
-        let mut last_keepalive = Instant::now();
-        let mut last_input_log = Instant::now();
-        let mut input_bytes_since_log: usize = 0;
-        let mut consecutive_transport_errors = 0_u8;
-        let mut consecutive_write_errors = 0_u8;
-        session.set_blocking(false);
+        ssh_client::block_on(async move {
+            let mut pending_input: Vec<u8> = Vec::new();
+            let mut last_keepalive = Instant::now();
+            let mut last_input_log = Instant::now();
+            let mut input_bytes_since_log: usize = 0;
+            let mut closed = false;
 
-        loop {
-            match command_rx.try_recv() {
-                Ok(WorkerCommand::Close) => {
+            while !closed {
+                match command_rx.try_recv() {
+                    Ok(WorkerCommand::Close) => {
                         println!(
                             "[ssh] close requested session_id={}",
                             worker_session_id
                         );
-                        let _ = channel.close();
-                        break;
-                }
-                Ok(WorkerCommand::Resize { cols, rows }) => {
-                    if cols > 0 && rows > 0 {
-                        let _ = channel.request_pty_size(cols, rows, None, None);
+                        closed = true;
                     }
-                }
-                Ok(WorkerCommand::Input(input)) => {
-                    pending_input.extend_from_slice(input.as_bytes());
-                    input_bytes_since_log += input.len();
-                }
-                Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => break,
-            }
-
-            if !pending_input.is_empty() {
-                // Non-blocking write: send as much as possible and retry next ticks.
-                let max_chunk = pending_input.len().min(1024);
-                match channel.write(&pending_input[..max_chunk]) {
-                    Ok(written) => {
-                        if written > 0 {
-                            pending_input.drain(..written);
-                        }
-                        consecutive_write_errors = 0;
-                    }
-                    Err(err) => {
-                        if err.kind() == ErrorKind::WouldBlock {
-                            // Not ready yet; try again after a short sleep below.
-                        } else {
-                            // libssh2 occasionally surfaces transient internal errors
-                            // (e.g. "Failure while draining incoming flow",
-                            // "Would block", "transport read") during non-blocking
-                            // writes when an incoming packet is mid-flight. These
-                            // are recoverable; tolerate a burst before giving up.
-                            let err_text = err.to_string().to_lowercase();
-                            let is_transient = err_text.contains("drain")
-                                || err_text.contains("would block")
-                                || err_text.contains("transport read")
-                                || err_text.contains("try again")
-                                || err_text.contains("timed out");
-                            if is_transient {
-                                consecutive_write_errors =
-                                    consecutive_write_errors.saturating_add(1);
-                                if consecutive_write_errors < 32 {
-                                    eprintln!(
-                                        "[ssh] write transient session_id={} err={} retry={}",
-                                        worker_session_id, err, consecutive_write_errors
-                                    );
-                                    thread::sleep(Duration::from_millis(80));
-                                } else {
-                                    eprintln!(
-                                        "[ssh] write failed session_id={} err={}",
-                                        worker_session_id, err
-                                    );
-                                    let _ = output_tx.send(
-                                        "\n[error] failed to write to shell\n".to_string(),
-                                    );
-                                    break;
-                                }
-                            } else {
-                                eprintln!(
-                                    "[ssh] write failed session_id={} err={}",
-                                    worker_session_id, err
-                                );
-                                let _ = output_tx
-                                    .send("\n[error] failed to write to shell\n".to_string());
-                                break;
-                            }
+                    Ok(WorkerCommand::Resize { cols, rows }) => {
+                        if cols > 0 && rows > 0 {
+                            let _ = channel.window_change(cols, rows, 0, 0).await;
                         }
                     }
+                    Ok(WorkerCommand::Input(input)) => {
+                        pending_input.extend_from_slice(input.as_bytes());
+                        input_bytes_since_log += input.len();
+                    }
+                    Err(TryRecvError::Empty) => {}
+                    Err(TryRecvError::Disconnected) => {
+                        closed = true;
+                    }
                 }
-            }
 
-            if last_input_log.elapsed() >= Duration::from_millis(250) {
-                if input_bytes_since_log > 0 {
-                    println!(
-                        "[ssh] input traffic session_id={} bytes_250ms={}",
-                        worker_session_id, input_bytes_since_log
-                    );
-                    input_bytes_since_log = 0;
+                if !pending_input.is_empty() {
+                    let max_chunk = pending_input.len().min(1024);
+                    if let Err(err) = channel.data(&pending_input[..max_chunk]).await {
+                        eprintln!(
+                            "[ssh] write failed session_id={} err={}",
+                            worker_session_id, err
+                        );
+                        let _ = output_tx
+                            .send("\n[error] failed to write to shell\n".to_string());
+                        closed = true;
+                    } else {
+                        pending_input.drain(..max_chunk);
+                    }
                 }
-                last_input_log = Instant::now();
-            }
 
-            match channel.read(&mut buf) {
-                Ok(0) => {
-                    if channel.eof() {
+                if last_input_log.elapsed() >= Duration::from_millis(250) {
+                    if input_bytes_since_log > 0 {
+                        println!(
+                            "[ssh] input traffic session_id={} bytes_250ms={}",
+                            worker_session_id, input_bytes_since_log
+                        );
+                        input_bytes_since_log = 0;
+                    }
+                    last_input_log = Instant::now();
+                }
+
+                let wait = tokio::time::timeout(Duration::from_millis(30), channel.wait());
+                match wait.await {
+                    Ok(Some(ChannelMsg::Data { data })) => {
+                        let text = String::from_utf8_lossy(&data).to_string();
+                        let _ = output_tx.send(text);
+                    }
+                    Ok(Some(ChannelMsg::ExtendedData { data, .. })) => {
+                        let text = String::from_utf8_lossy(&data).to_string();
+                        let _ = output_tx.send(text);
+                    }
+                    Ok(Some(ChannelMsg::Eof)) => {
                         let _ = output_tx.send("\n[session closed]\n".to_string());
-                        break;
+                        closed = true;
                     }
-                }
-                Ok(n) => {
-                    consecutive_transport_errors = 0;
-                    let text = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let _ = output_tx.send(text);
-                }
-                Err(err) => {
-                    let err_text = err.to_string().to_lowercase();
-                    if err.kind() != ErrorKind::WouldBlock {
-                        // Transient libssh2 read spikes ("Transport read", "Failure
-                        // while draining incoming flow", spurious "Would block" text
-                        // messages) can appear under load; tolerate a burst before
-                        // dropping the session.
-                        let is_transient = err_text.contains("transport read")
-                            || err_text.contains("drain")
-                            || err_text.contains("would block")
-                            || err_text.contains("try again")
-                            || err_text.contains("timed out");
-                        if is_transient {
-                            consecutive_transport_errors =
-                                consecutive_transport_errors.saturating_add(1);
-                            if consecutive_transport_errors < 16 {
-                                thread::sleep(Duration::from_millis(120));
-                                continue;
-                            }
-                        }
-                        eprintln!("[ssh] read failed session_id={} err={}", worker_session_id, err);
-                        let _ = output_tx.send(format!("\n[error] {}\n", err));
-                        break;
+                    Ok(Some(ChannelMsg::Close)) => {
+                        closed = true;
                     }
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        closed = true;
+                    }
+                    Err(_) => {}
+                }
+
+                if last_keepalive.elapsed() >= Duration::from_secs(10) {
+                    let ssh = worker_ssh.lock().await;
+                    let _ = ssh.send_keepalive(false).await;
+                    last_keepalive = Instant::now();
                 }
             }
 
-            if last_keepalive.elapsed() >= Duration::from_secs(10) {
-                let _ = session.keepalive_send();
-                last_keepalive = Instant::now();
-            }
-
-            thread::sleep(Duration::from_millis(30));
-        }
-
-        let _ = session.disconnect(None, "Client closed shell", None);
+            let _ = channel.close().await;
+            let ssh = worker_ssh.lock().await;
+            let _ = ssh_client::disconnect_async(&ssh, "Client closed shell").await;
+        });
         worker_alive.store(false, Ordering::SeqCst);
-        println!("[ssh] worker thread ended session_id={}", worker_session_id);
+        println!("[ssh] worker thread ended session_id={}", worker_log_id);
     });
 
     let mut guard = sessions.sessions.lock().map_err(|_| "Session lock poisoned")?;
@@ -648,46 +445,21 @@ async fn ssh_fetch_host_metrics(
     };
 
     tauri::async_runtime::spawn_blocking(move || {
-        let guard = shared_session
-            .lock()
-            .map_err(|_| "Session lock poisoned".to_string())?;
-        ssh_fetch_host_metrics_blocking(&guard)
+        ssh_client::block_on(async move {
+            let handle = shared_session.lock().await;
+            ssh_fetch_host_metrics_async(&handle).await
+        })
     })
         .await
         .map_err(|e| format!("Metrics worker thread failed: {e}"))?
 }
 
-fn ssh_fetch_host_metrics_blocking(session: &Session) -> Result<SshHostMetricsResponse, String> {
-    fn is_ssh_would_block(err: &ssh2::Error) -> bool {
-        matches!(err.code(), ssh2::ErrorCode::Session(code) if code == -37)
-            || err.to_string().to_lowercase().contains("would block")
-    }
-
-    fn retry_ssh_call<T, F>(mut f: F, what: &str) -> Result<T, String>
-    where
-        F: FnMut() -> Result<T, ssh2::Error>,
-    {
-        let mut last_err: Option<ssh2::Error> = None;
-        for _ in 0..120 {
-            match f() {
-                Ok(v) => return Ok(v),
-                Err(err) if is_ssh_would_block(&err) => {
-                    last_err = Some(err);
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                Err(err) => return Err(format!("{what}: {err}")),
-            }
-        }
-        Err(format!(
-            "{what}: {}",
-            last_err
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| "timeout waiting for SSH readiness".to_string())
-        ))
-    }
-
-    let mut channel = retry_ssh_call(|| session.channel_session(), "Failed to open metrics channel")?;
-    let command = r#"sh -lc "
+async fn ssh_fetch_host_metrics_async(handle: &SshHandle) -> Result<SshHostMetricsResponse, String> {
+        let mut channel = handle
+            .channel_open_session()
+            .await
+            .map_err(|e| format!("Failed to open metrics channel: {e}"))?;
+        let command = r#"sh -lc "
 cpu_model=\$(grep -m1 -E '^(model name|Hardware|Processor)[[:space:]]*:' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | sed 's/^[[:space:]]*//;s/[[:space:]]*$//');
 [ -n \"\$cpu_model\" ] || cpu_model=Unknown;
 read cpu user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat;
@@ -728,62 +500,66 @@ echo \"mem_available_kb=\$mem_avail\";
 echo \"upload_kbps=\$upload_kbps\";
 echo \"download_kbps=\$download_kbps\";
 ""#;
-    retry_ssh_call(
-        || channel.exec(command),
-        "Failed to execute metrics command",
-    )?;
-    let mut out = String::new();
-    let mut buf = [0_u8; 4096];
-    loop {
-        match channel.read(&mut buf) {
-            Ok(0) => {
-                if channel.eof() {
-                    break;
+        channel
+            .exec(true, command)
+            .await
+            .map_err(|e| format!("Failed to execute metrics command: {e}"))?;
+
+        let mut out = String::new();
+        let mut exit_seen = false;
+        loop {
+            match channel.wait().await {
+                Some(ChannelMsg::Data { data }) => {
+                    out.push_str(&String::from_utf8_lossy(&data));
                 }
+                Some(ChannelMsg::ExtendedData { data, .. }) => {
+                    out.push_str(&String::from_utf8_lossy(&data));
+                }
+                Some(ChannelMsg::ExitStatus { .. }) => {
+                    exit_seen = true;
+                }
+                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
+                Some(_) if exit_seen => break,
+                Some(_) => {}
             }
-            Ok(n) => out.push_str(&String::from_utf8_lossy(&buf[..n])),
-            Err(err) if err.kind() == ErrorKind::WouldBlock => {}
-            Err(err) => return Err(format!("Failed to read metrics output: {err}")),
         }
-        std::thread::sleep(Duration::from_millis(15));
-    }
-    let _ = channel.wait_close();
+        let _ = channel.close().await;
 
-    let mut kv: HashMap<String, String> = HashMap::new();
-    for line in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        if let Some((k, v)) = line.split_once('=') {
-            kv.insert(k.trim().to_string(), v.trim().to_string());
+        let mut kv: HashMap<String, String> = HashMap::new();
+        for line in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            if let Some((k, v)) = line.split_once('=') {
+                kv.insert(k.trim().to_string(), v.trim().to_string());
+            }
         }
-    }
 
-    let cpu_model = kv
-        .get("cpu_model")
-        .filter(|v| !v.is_empty())
-        .cloned()
-        .unwrap_or_else(|| "Unknown".to_string());
-    let cpu_usage_percent = kv
-        .get("cpu_usage_percent")
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(0.0);
-    let mem_total_kb = kv
-        .get("mem_total_kb")
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0);
-    let mem_available_kb = kv
-        .get("mem_available_kb")
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0);
-    let upload_kbps = kv
-        .get("upload_kbps")
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(0.0);
-    let download_kbps = kv
-        .get("download_kbps")
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(0.0);
-    let ram_total_mb = mem_total_kb / 1024;
-    let ram_available_mb = mem_available_kb / 1024;
-    let ram_used_mb = ram_total_mb.saturating_sub(ram_available_mb);
+        let cpu_model = kv
+            .get("cpu_model")
+            .filter(|v| !v.is_empty())
+            .cloned()
+            .unwrap_or_else(|| "Unknown".to_string());
+        let cpu_usage_percent = kv
+            .get("cpu_usage_percent")
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let mem_total_kb = kv
+            .get("mem_total_kb")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        let mem_available_kb = kv
+            .get("mem_available_kb")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        let upload_kbps = kv
+            .get("upload_kbps")
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let download_kbps = kv
+            .get("download_kbps")
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let ram_total_mb = mem_total_kb / 1024;
+        let ram_available_mb = mem_available_kb / 1024;
+        let ram_used_mb = ram_total_mb.saturating_sub(ram_available_mb);
 
     Ok(SshHostMetricsResponse {
         cpu_model,

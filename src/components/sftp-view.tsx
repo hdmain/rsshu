@@ -37,6 +37,7 @@ export type SftpOpenEditMode = "auto" | "confirm";
 
 type SftpViewProps = {
   sessionId: string;
+  hostId: string;
   home: string;
   hostLabel: string;
   hideDotfiles: boolean;
@@ -68,20 +69,38 @@ type SftpViewState = {
 /** Module-level cache — survives React unmount/remount within the same app session. */
 const _memCache = new Map<string, SftpViewState>();
 
-function saveViewState(sessionId: string, state: SftpViewState) {
-  _memCache.set(sessionId, state);
+/** Per-path directory listing cache — keyed by `${sessionId}:${normalizedPath}`. */
+const _entriesCache = new Map<string, SftpEntry[]>();
+
+function entriesCacheKey(sessionId: string, path: string) {
+  return `${sessionId}:${path}`;
+}
+
+export function clearSftpSessionCache(sessionId: string, hostId: string) {
+  // Entries cache is per-session (connection-specific).
+  for (const key of Array.from(_entriesCache.keys())) {
+    if (key.startsWith(`${sessionId}:`)) _entriesCache.delete(key);
+  }
+  // View-state cache (path, tracked files) is per-host — keep it so the
+  // path is remembered when reconnecting, but allow the caller to wipe it
+  // explicitly on vault-lock / host-delete by passing the hostId.
+  _memCache.delete(hostId);
+}
+
+function saveViewState(hostId: string, state: SftpViewState) {
+  _memCache.set(hostId, state);
   try {
-    localStorage.setItem(`rsshu.sftp.viewState.${sessionId}`, JSON.stringify(state));
+    localStorage.setItem(`rsshu.sftp.viewState.${hostId}`, JSON.stringify(state));
   } catch {
     // storage quota exceeded — in-memory cache still works
   }
 }
 
-function loadViewState(sessionId: string, home: string): SftpViewState {
-  const mem = _memCache.get(sessionId);
+function loadViewState(hostId: string, home: string): SftpViewState {
+  const mem = _memCache.get(hostId);
   if (mem) return mem;
   try {
-    const raw = localStorage.getItem(`rsshu.sftp.viewState.${sessionId}`);
+    const raw = localStorage.getItem(`rsshu.sftp.viewState.${hostId}`);
     if (raw) {
       const parsed = JSON.parse(raw) as Partial<SftpViewState>;
       const trackedOpen = Array.isArray(parsed.trackedOpen)
@@ -190,23 +209,25 @@ const AUTO_UPLOAD_DEBOUNCE_MS = 1200;
 
 export function SftpView({
   sessionId,
+  hostId,
   home,
   hostLabel,
   hideDotfiles,
   openEditMode,
   onDisconnect,
 }: SftpViewProps) {
-  const [currentPath, setCurrentPath] = useState<string>(
-    () => loadViewState(sessionId, home).currentPath,
+  const initialPath = normalizeFsPath(loadViewState(hostId, home).currentPath);
+  const [currentPath, setCurrentPath] = useState<string>(initialPath);
+  const [entries, setEntries] = useState<SftpEntry[]>(
+    () => _entriesCache.get(entriesCacheKey(sessionId, initialPath)) ?? [],
   );
-  const [entries, setEntries] = useState<SftpEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string>("");
   const [busyPath, setBusyPath] = useState<string | null>(null);
   const [transfer, setTransfer] = useState<TransferInfo | null>(null);
   const [dragOver, setDragOver] = useState(false);
   const [trackedOpen, setTrackedOpen] = useState<TrackedOpenFile[]>(
-    () => loadViewState(sessionId, home).trackedOpen,
+    () => loadViewState(hostId, home).trackedOpen,
   );
   const trackedRef = useRef<TrackedOpenFile[]>([]);
   const dropZoneRef = useRef<HTMLDivElement | null>(null);
@@ -230,16 +251,28 @@ export function SftpView({
   }, [currentPath]);
 
   useEffect(() => {
-    saveViewState(sessionId, { currentPath, trackedOpen });
-  }, [sessionId, currentPath, trackedOpen]);
+    saveViewState(hostId, { currentPath, trackedOpen });
+  }, [sessionId, hostId, currentPath, trackedOpen]);
 
   const load = useCallback(
     async (path: string) => {
-      setLoading(true);
-      setError("");
       const pathNorm = normalizeFsPath(path);
+      const cacheKey = entriesCacheKey(sessionId, pathNorm);
+      const cached = _entriesCache.get(cacheKey);
+
+      // Show cached entries immediately so the UI never blanks out.
+      if (cached) {
+        setEntries(cached);
+        setCurrentPath(pathNorm);
+      } else {
+        // First time loading this path — show spinner.
+        setLoading(true);
+      }
+      setError("");
+
       try {
         const list = await invoke<SftpEntry[]>("sftp_list", { sessionId, path: pathNorm });
+        _entriesCache.set(cacheKey, list);
         setEntries(list);
         setCurrentPath(pathNorm);
       } catch (e) {

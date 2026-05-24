@@ -1,17 +1,14 @@
-use anyhow::{Context, Result};
+use crate::ssh_client::{self, SshConnectParams, SshHandle};
+use anyhow::Result;
+use russh_sftp::protocol::OpenFlags;
 use serde::{Deserialize, Serialize};
-use ssh2::{OpenFlags, OpenType, Session};
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex as StdMutex};
+use tokio::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::time::Duration;
 use tauri::State;
-use tempfile::NamedTempFile;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Debug, Deserialize)]
 pub struct SftpConnectRequest {
@@ -41,20 +38,20 @@ pub struct SftpEntry {
 }
 
 pub struct SftpSessionState {
-    session: Arc<Mutex<Session>>,
+    session: Arc<Mutex<SshHandle>>,
     last_touch_ms: Arc<AtomicU64>,
 }
 
 pub struct SftpSessions {
     next_id: AtomicU64,
-    sessions: Mutex<HashMap<String, SftpSessionState>>,
+    sessions: StdMutex<HashMap<String, SftpSessionState>>,
 }
 
 impl SftpSessions {
     pub fn new() -> Self {
         Self {
             next_id: AtomicU64::new(1),
-            sessions: Mutex::new(HashMap::new()),
+            sessions: StdMutex::new(HashMap::new()),
         }
     }
 
@@ -86,9 +83,7 @@ impl SftpSessions {
         }
         let count = stale.len();
         for state in stale {
-            if let Ok(session) = state.session.lock() {
-                let _ = session.disconnect(None, "Idle timeout cleanup", None);
-            }
+            let _ = ssh_client::disconnect_session(state.session, "Idle timeout cleanup");
         }
         count
     }
@@ -100,9 +95,7 @@ impl SftpSessions {
             Vec::new()
         };
         for state in sessions {
-            if let Ok(session) = state.session.lock() {
-                let _ = session.disconnect(None, reason, None);
-            }
+            let _ = ssh_client::disconnect_session(state.session, reason);
         }
     }
 }
@@ -114,69 +107,14 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn connect(req: &SftpConnectRequest) -> Result<Session> {
-    let tcp = tcp_connect_with_timeout(&req.host, req.port, Duration::from_secs(8))?;
-    let _ = tcp.set_read_timeout(Some(Duration::from_secs(30)));
-    let _ = tcp.set_write_timeout(Some(Duration::from_secs(30)));
-    let mut session = Session::new().context("Failed to create SSH session")?;
-    session.set_tcp_stream(tcp);
-    session.handshake().context("SSH handshake failed")?;
-
-    if let Some(private_key) = &req.private_key {
-        let mut key_file = NamedTempFile::new().context("Failed to create key temp file")?;
-        key_file
-            .write_all(private_key.as_bytes())
-            .context("Failed to write key temp file")?;
-        session
-            .userauth_pubkey_file(
-                &req.username,
-                None,
-                key_file.path(),
-                req.passphrase.as_deref(),
-            )
-            .context("SSH key authentication failed")?;
-    } else if let Some(password) = &req.password {
-        crate::authenticate_password_fallback_session(&session, &req.username, password, || {})
-            .context("SSH password authentication failed")?;
-    } else {
-        return Err(anyhow::anyhow!("Missing password or private key"));
-    }
-
-    if !session.authenticated() {
-        return Err(anyhow::anyhow!("SSH authentication did not complete"));
-    }
-    session.set_keepalive(true, 30);
-    Ok(session)
-}
-
-fn tcp_connect_with_timeout(host: &str, port: u16, timeout: Duration) -> Result<TcpStream> {
-    let mut last_err: Option<std::io::Error> = None;
-    let addrs: Vec<_> = (host, port)
-        .to_socket_addrs()
-        .with_context(|| format!("DNS resolve failed for {host}:{port}"))?
-        .collect();
-    if addrs.is_empty() {
-        return Err(anyhow::anyhow!("DNS resolve returned no addresses for {host}:{port}"));
-    }
-    for addr in addrs {
-        match TcpStream::connect_timeout(&addr, timeout) {
-            Ok(tcp) => return Ok(tcp),
-            Err(err) => last_err = Some(err),
-        }
-    }
-    Err(anyhow::anyhow!(
-        "TCP connect failed to {host}:{port} (host unreachable / blocked port / wrong address / timeout): {}",
-        last_err
-            .map(|e| e.to_string())
-            .unwrap_or_else(|| "unknown network error".to_string())
-    ))
-}
-
-fn normalize(path: &str) -> String {
-    if path.is_empty() {
-        "/".to_string()
-    } else {
-        path.to_string()
+fn connect_params(req: &SftpConnectRequest) -> SshConnectParams {
+    SshConnectParams {
+        host: req.host.clone(),
+        port: req.port,
+        username: req.username.clone(),
+        password: req.password.clone(),
+        private_key: req.private_key.clone(),
+        passphrase: req.passphrase.clone(),
     }
 }
 
@@ -189,22 +127,17 @@ pub async fn sftp_connect(
         "[sftp] connect requested host={} port={} user={}",
         req.host, req.port, req.username
     );
-    let req_for_connect = SftpConnectRequest {
-        host: req.host.clone(),
-        port: req.port,
-        username: req.username.clone(),
-        password: req.password.clone(),
-        private_key: req.private_key.clone(),
-        passphrase: req.passphrase.clone(),
-    };
+    let params = connect_params(&req);
     let (session, home) = tauri::async_runtime::spawn_blocking(move || {
-        let session = connect(&req_for_connect)?;
-        let sftp = session.sftp().map_err(anyhow::Error::from)?;
-        let home = match sftp.realpath(Path::new(".")) {
-            Ok(p) => p.to_string_lossy().to_string(),
-            Err(_) => "/".to_string(),
-        };
-        Ok::<(Session, String), anyhow::Error>((session, home))
+        ssh_client::block_on(async move {
+            let session = ssh_client::connect_async(params).await?;
+            let sftp = ssh_client::open_sftp_session(&session).await?;
+            let home = sftp
+                .canonicalize(".")
+                .await
+                .unwrap_or_else(|_| "/".to_string());
+            Ok::<(SshHandle, String), anyhow::Error>((session, home))
+        })
     })
     .await
     .map_err(|e| format!("SFTP connect worker thread failed: {e}"))?
@@ -229,26 +162,19 @@ pub async fn sftp_connect(
     })
 }
 
-fn with_session<T, F: FnOnce(&Session) -> Result<T, String>>(
+fn sftp_ssh_session(
     sessions: &State<'_, SftpSessions>,
     session_id: &str,
-    f: F,
-) -> Result<T, String> {
-    let handle = {
-        let guard = sessions
-            .sessions
-            .lock()
-            .map_err(|_| "Session lock poisoned".to_string())?;
-        let state = guard
-            .get(session_id)
-            .ok_or_else(|| "SFTP session not found".to_string())?;
-        state.last_touch_ms.store(now_ms(), Ordering::Relaxed);
-        state.session.clone()
-    };
-    let session = handle
+) -> Result<Arc<Mutex<SshHandle>>, String> {
+    let guard = sessions
+        .sessions
         .lock()
-        .map_err(|_| "SFTP session busy".to_string())?;
-    f(&session)
+        .map_err(|_| "Session lock poisoned".to_string())?;
+    let state = guard
+        .get(session_id)
+        .ok_or_else(|| "SFTP session not found".to_string())?;
+    state.last_touch_ms.store(now_ms(), Ordering::Relaxed);
+    Ok(state.session.clone())
 }
 
 #[tauri::command]
@@ -257,15 +183,16 @@ pub fn sftp_read_file(
     path: String,
     sessions: State<'_, SftpSessions>,
 ) -> Result<String, String> {
-    with_session(&sessions, &session_id, |session| {
-        let sftp = session.sftp().map_err(|e| e.to_string())?;
-        let mut remote = sftp
-            .open(Path::new(&path))
-            .map_err(|e| format!("open {}: {}", path, e))?;
-        let mut bytes = Vec::new();
-        remote
-            .read_to_end(&mut bytes)
-            .map_err(|e| format!("read {}: {}", path, e))?;
+    let session = sftp_ssh_session(&sessions, &session_id)?;
+    ssh_client::block_on(async move {
+        let handle = session.lock().await;
+        let sftp = ssh_client::open_sftp_session(&handle)
+            .await
+            .map_err(|e| e.to_string())?;
+        let bytes = sftp
+            .read(&path)
+            .await
+            .map_err(|e| format!("read {path}: {e}"))?;
         String::from_utf8(bytes).map_err(|_| "File is not valid UTF-8 text".to_string())
     })
 }
@@ -277,17 +204,25 @@ pub fn sftp_write_file(
     content: String,
     sessions: State<'_, SftpSessions>,
 ) -> Result<u64, String> {
-    with_session(&sessions, &session_id, |session| {
-        let sftp = session.sftp().map_err(|e| e.to_string())?;
-        let flags = OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE;
-        let mut remote = sftp
-            .open_mode(Path::new(&path), flags, 0o644, OpenType::File)
-            .map_err(|e| format!("open remote {}: {}", path, e))?;
-        remote
-            .write_all(content.as_bytes())
-            .map_err(|e| format!("write remote {}: {}", path, e))?;
+    let session = sftp_ssh_session(&sessions, &session_id)?;
+    ssh_client::block_on(async move {
+        let handle = session.lock().await;
+        let sftp = ssh_client::open_sftp_session(&handle)
+            .await
+            .map_err(|e| e.to_string())?;
+        sftp.write(&path, content.as_bytes())
+            .await
+            .map_err(|e| format!("write remote {path}: {e}"))?;
         Ok(content.len() as u64)
     })
+}
+
+fn normalize(path: &str) -> String {
+    if path.is_empty() {
+        "/".to_string()
+    } else {
+        path.to_string()
+    }
 }
 
 #[tauri::command]
@@ -297,31 +232,29 @@ pub fn sftp_list(
     sessions: State<'_, SftpSessions>,
 ) -> Result<Vec<SftpEntry>, String> {
     let path = normalize(&path);
-    with_session(&sessions, &session_id, |session| {
-        let sftp = session.sftp().map_err(|e| e.to_string())?;
+    let session = sftp_ssh_session(&sessions, &session_id)?;
+    ssh_client::block_on(async move {
+        let handle = session.lock().await;
+        let sftp = ssh_client::open_sftp_session(&handle)
+            .await
+            .map_err(|e| e.to_string())?;
         let entries = sftp
-            .readdir(Path::new(&path))
-            .map_err(|e| format!("readdir {}: {}", path, e))?;
+            .read_dir(&path)
+            .await
+            .map_err(|e| format!("readdir {path}: {e}"))?;
         let mut result: Vec<SftpEntry> = entries
-            .into_iter()
-            .map(|(p, stat)| {
-                let name = p
-                    .file_name()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| p.to_string_lossy().to_string());
-                let full = p.to_string_lossy().to_string();
-                let file_type = stat.file_type();
+            .map(|entry| {
+                let meta = entry.metadata();
                 SftpEntry {
-                    name,
-                    path: full,
-                    is_dir: file_type.is_dir(),
-                    is_symlink: file_type.is_symlink(),
-                    size: stat.size.unwrap_or(0),
-                    mtime: stat.mtime.unwrap_or(0),
-                    perm: stat.perm.unwrap_or(0),
+                    name: entry.file_name(),
+                    path: entry.path(),
+                    is_dir: meta.is_dir(),
+                    is_symlink: meta.is_symlink(),
+                    size: meta.size.unwrap_or(0),
+                    mtime: meta.mtime.unwrap_or(0) as u64,
+                    perm: meta.permissions.unwrap_or(0),
                 }
             })
-            .filter(|e| e.name != "." && e.name != "..")
             .collect();
         result.sort_by(|a, b| match (a.is_dir, b.is_dir) {
             (true, false) => std::cmp::Ordering::Less,
@@ -339,12 +272,15 @@ pub fn sftp_realpath(
     sessions: State<'_, SftpSessions>,
 ) -> Result<String, String> {
     let path = normalize(&path);
-    with_session(&sessions, &session_id, |session| {
-        let sftp = session.sftp().map_err(|e| e.to_string())?;
-        let p = sftp
-            .realpath(Path::new(&path))
-            .map_err(|e| format!("realpath {}: {}", path, e))?;
-        Ok(p.to_string_lossy().to_string())
+    let session = sftp_ssh_session(&sessions, &session_id)?;
+    ssh_client::block_on(async move {
+        let handle = session.lock().await;
+        let sftp = ssh_client::open_sftp_session(&handle)
+            .await
+            .map_err(|e| e.to_string())?;
+        sftp.canonicalize(&path)
+            .await
+            .map_err(|e| format!("realpath {path}: {e}"))
     })
 }
 
@@ -354,10 +290,15 @@ pub fn sftp_mkdir(
     path: String,
     sessions: State<'_, SftpSessions>,
 ) -> Result<(), String> {
-    with_session(&sessions, &session_id, |session| {
-        let sftp = session.sftp().map_err(|e| e.to_string())?;
-        sftp.mkdir(Path::new(&path), 0o755)
-            .map_err(|e| format!("mkdir {}: {}", path, e))
+    let session = sftp_ssh_session(&sessions, &session_id)?;
+    ssh_client::block_on(async move {
+        let handle = session.lock().await;
+        let sftp = ssh_client::open_sftp_session(&handle)
+            .await
+            .map_err(|e| e.to_string())?;
+        sftp.create_dir(&path)
+            .await
+            .map_err(|e| format!("mkdir {path}: {e}"))
     })
 }
 
@@ -367,10 +308,15 @@ pub fn sftp_remove_file(
     path: String,
     sessions: State<'_, SftpSessions>,
 ) -> Result<(), String> {
-    with_session(&sessions, &session_id, |session| {
-        let sftp = session.sftp().map_err(|e| e.to_string())?;
-        sftp.unlink(Path::new(&path))
-            .map_err(|e| format!("unlink {}: {}", path, e))
+    let session = sftp_ssh_session(&sessions, &session_id)?;
+    ssh_client::block_on(async move {
+        let handle = session.lock().await;
+        let sftp = ssh_client::open_sftp_session(&handle)
+            .await
+            .map_err(|e| e.to_string())?;
+        sftp.remove_file(&path)
+            .await
+            .map_err(|e| format!("unlink {path}: {e}"))
     })
 }
 
@@ -380,10 +326,15 @@ pub fn sftp_remove_dir(
     path: String,
     sessions: State<'_, SftpSessions>,
 ) -> Result<(), String> {
-    with_session(&sessions, &session_id, |session| {
-        let sftp = session.sftp().map_err(|e| e.to_string())?;
-        sftp.rmdir(Path::new(&path))
-            .map_err(|e| format!("rmdir {}: {}", path, e))
+    let session = sftp_ssh_session(&sessions, &session_id)?;
+    ssh_client::block_on(async move {
+        let handle = session.lock().await;
+        let sftp = ssh_client::open_sftp_session(&handle)
+            .await
+            .map_err(|e| e.to_string())?;
+        sftp.remove_dir(&path)
+            .await
+            .map_err(|e| format!("rmdir {path}: {e}"))
     })
 }
 
@@ -394,10 +345,15 @@ pub fn sftp_rename(
     to: String,
     sessions: State<'_, SftpSessions>,
 ) -> Result<(), String> {
-    with_session(&sessions, &session_id, |session| {
-        let sftp = session.sftp().map_err(|e| e.to_string())?;
-        sftp.rename(Path::new(&from), Path::new(&to), None)
-            .map_err(|e| format!("rename {} -> {}: {}", from, to, e))
+    let session = sftp_ssh_session(&sessions, &session_id)?;
+    ssh_client::block_on(async move {
+        let handle = session.lock().await;
+        let sftp = ssh_client::open_sftp_session(&handle)
+            .await
+            .map_err(|e| e.to_string())?;
+        sftp.rename(&from, &to)
+            .await
+            .map_err(|e| format!("rename {from} -> {to}: {e}"))
     })
 }
 
@@ -412,34 +368,44 @@ pub fn sftp_download(
         "[sftp] download id={} remote={} local={}",
         session_id, remote_path, local_path
     );
-    let local = PathBuf::from(&local_path);
+    let local = std::path::PathBuf::from(&local_path);
     if let Some(parent) = local.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("create local dir {}: {}", parent.display(), e))?;
         }
     }
-    with_session(&sessions, &session_id, |session| {
-        let sftp = session.sftp().map_err(|e| e.to_string())?;
+    let session = sftp_ssh_session(&sessions, &session_id)?;
+    ssh_client::block_on(async move {
+        let handle = session.lock().await;
+        let sftp = ssh_client::open_sftp_session(&handle)
+            .await
+            .map_err(|e| e.to_string())?;
         let mut remote = sftp
-            .open(Path::new(&remote_path))
-            .map_err(|e| format!("open {}: {}", remote_path, e))?;
-        let mut file =
-            File::create(&local).map_err(|e| format!("create {}: {}", local.display(), e))?;
-        let mut buf = vec![0u8; 64 * 1024];
+            .open(&remote_path)
+            .await
+            .map_err(|e| format!("open {remote_path}: {e}"))?;
+        let mut file = tokio::fs::File::create(&local)
+            .await
+            .map_err(|e| format!("create {}: {}", local.display(), e))?;
         let mut total: u64 = 0;
+        let mut buf = vec![0u8; 64 * 1024];
         loop {
-            match remote.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    file.write_all(&buf[..n])
-                        .map_err(|e| format!("write local: {}", e))?;
-                    total += n as u64;
-                }
-                Err(e) => return Err(format!("read remote: {}", e)),
+            let n = remote
+                .read(&mut buf)
+                .await
+                .map_err(|e| format!("read remote: {e}"))?;
+            if n == 0 {
+                break;
             }
+            file.write_all(&buf[..n])
+                .await
+                .map_err(|e| format!("write local: {e}"))?;
+            total += n as u64;
         }
-        file.flush().map_err(|e| format!("flush: {}", e))?;
+        file.flush()
+            .await
+            .map_err(|e| format!("flush: {e}"))?;
         Ok(total)
     })
 }
@@ -455,27 +421,35 @@ pub fn sftp_upload(
         "[sftp] upload id={} local={} remote={}",
         session_id, local_path, remote_path
     );
-    with_session(&sessions, &session_id, |session| {
-        let sftp = session.sftp().map_err(|e| e.to_string())?;
-        let mut file = File::open(&local_path)
-            .map_err(|e| format!("open local {}: {}", local_path, e))?;
+    let session = sftp_ssh_session(&sessions, &session_id)?;
+    ssh_client::block_on(async move {
+        let handle = session.lock().await;
+        let sftp = ssh_client::open_sftp_session(&handle)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut file = tokio::fs::File::open(&local_path)
+            .await
+            .map_err(|e| format!("open local {local_path}: {e}"))?;
         let flags = OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE;
         let mut remote = sftp
-            .open_mode(Path::new(&remote_path), flags, 0o644, OpenType::File)
-            .map_err(|e| format!("open remote {}: {}", remote_path, e))?;
+            .open_with_flags(&remote_path, flags)
+            .await
+            .map_err(|e| format!("open remote {remote_path}: {e}"))?;
         let mut buf = vec![0u8; 64 * 1024];
         let mut total: u64 = 0;
         loop {
-            match file.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    remote
-                        .write_all(&buf[..n])
-                        .map_err(|e| format!("write remote: {}", e))?;
-                    total += n as u64;
-                }
-                Err(e) => return Err(format!("read local: {}", e)),
+            let n = file
+                .read(&mut buf)
+                .await
+                .map_err(|e| format!("read local: {e}"))?;
+            if n == 0 {
+                break;
             }
+            remote
+                .write_all(&buf[..n])
+                .await
+                .map_err(|e| format!("write remote: {e}"))?;
+            total += n as u64;
         }
         Ok(total)
     })
@@ -492,9 +466,7 @@ pub fn sftp_disconnect(
         .lock()
         .map_err(|_| "Session lock poisoned".to_string())?;
     if let Some(state) = guard.remove(&session_id) {
-        if let Ok(session) = state.session.lock() {
-            let _ = session.disconnect(None, "Client closed SFTP", None);
-        }
+        let _ = ssh_client::disconnect_session(state.session, "Client closed SFTP");
     }
     Ok(())
 }
