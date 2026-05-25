@@ -20,6 +20,7 @@ import {
   Terminal,
   Trash2,
   Unplug,
+  Eye,
   EyeOff,
   X,
   Settings2,
@@ -42,6 +43,7 @@ import {
   formatSessionTabLabel,
   hostCardSubtitle,
   hostCardTitle,
+  hostPasswordDisplay,
   redactConnectionLogLine,
 } from "@/lib/privacy-display";
 
@@ -216,6 +218,8 @@ function App() {
   const [activeHostId, setActiveHostId] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [isHostModalOpen, setIsHostModalOpen] = useState(false);
+  const [showHostModalPassword, setShowHostModalPassword] = useState(false);
+  const [revealedHostPasswords, setRevealedHostPasswords] = useState<Record<string, boolean>>({});
   const [draft, setDraft] = useState<HostDraft>(emptyDraft);
   const [tabs, setTabs] = useState<SessionTab[]>([]);
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
@@ -787,8 +791,13 @@ function App() {
     setCollapsedGroups((prev) => ({ ...prev, [groupName]: !prev[groupName] }));
   }
 
+  function toggleHostPasswordReveal(hostId: string) {
+    setRevealedHostPasswords((prev) => ({ ...prev, [hostId]: !prev[hostId] }));
+  }
+
   function openNewHostModal() {
     setDraft(emptyDraft);
+    setShowHostModalPassword(false);
     setIsHostModalOpen(true);
   }
 
@@ -806,6 +815,7 @@ function App() {
       passphrase: host.passphrase ?? "",
       tags: host.tags.join(","),
     });
+    setShowHostModalPassword(false);
     setIsHostModalOpen(true);
   }
 
@@ -1221,6 +1231,11 @@ function App() {
                         <div className="divide-y divide-white/5 border-t border-white/5">
                           {list.map((host) => {
                             const hostStatus = hostStatuses[host.id] ?? "offline";
+                            const passwordLabel = hostPasswordDisplay(
+                              host,
+                              privacyRedactHosts,
+                              !!revealedHostPasswords[host.id],
+                            );
                             return (
                               <div
                                 key={host.id}
@@ -1235,6 +1250,34 @@ function App() {
                                     <p className="truncate text-xs text-slate-400">
                                       {hostCardSubtitle(host, privacyRedactHosts)}
                                     </p>
+                                    {passwordLabel ? (
+                                      <div className="mt-0.5 flex items-center gap-1.5">
+                                        <KeyRound className="h-3 w-3 shrink-0 text-slate-500" />
+                                        <span className="truncate font-mono text-[11px] text-slate-500">
+                                          {passwordLabel}
+                                        </span>
+                                        {!privacyRedactHosts && host.password ? (
+                                          <button
+                                            type="button"
+                                            className="shrink-0 rounded p-0.5 text-slate-500 hover:bg-white/10 hover:text-slate-300"
+                                            title={
+                                              revealedHostPasswords[host.id]
+                                                ? "Hide password"
+                                                : "Show password"
+                                            }
+                                            onClick={() => toggleHostPasswordReveal(host.id)}
+                                          >
+                                            {revealedHostPasswords[host.id] ? (
+                                              <EyeOff className="h-3 w-3" />
+                                            ) : (
+                                              <Eye className="h-3 w-3" />
+                                            )}
+                                          </button>
+                                        ) : null}
+                                      </div>
+                                    ) : host.authMethod === "key" ? (
+                                      <p className="mt-0.5 text-[11px] text-slate-500">Private key</p>
+                                    ) : null}
                                   </div>
                                   {host.tags.length > 0 ? (
                                     <div className="ml-2 hidden gap-1 lg:flex">
@@ -1408,8 +1451,9 @@ function App() {
                           <div className="min-w-0">
                             <CardTitle className="text-slate-100">Hide hosts and IPs in the UI</CardTitle>
                             <CardDescription className="text-slate-400">
-                              Masks addresses on the host list, in terminal tabs, in the SSH connect log, and on
-                              disconnected / SFTP headers. Vault data and the edit-host form stay full.
+                              Masks addresses and saved passwords on the host list, in terminal tabs, in the SSH
+                              connect log, and on disconnected / SFTP headers. Vault data and the edit-host form
+                              stay full unless you reveal them there.
                             </CardDescription>
                           </div>
                         </div>
@@ -1681,7 +1725,23 @@ function App() {
                   </Button>
                 </div>
                 {draft.authMethod === "password" ? (
-                  <Input type="password" placeholder="Password" value={draft.password} onChange={(e) => setDraft((prev) => ({ ...prev, password: e.target.value }))} />
+                  <div className="relative">
+                    <Input
+                      type={showHostModalPassword ? "text" : "password"}
+                      placeholder="Password"
+                      value={draft.password}
+                      onChange={(e) => setDraft((prev) => ({ ...prev, password: e.target.value }))}
+                      className="pr-10 font-mono"
+                    />
+                    <button
+                      type="button"
+                      className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-1 text-slate-400 hover:bg-white/10 hover:text-slate-200"
+                      title={showHostModalPassword ? "Hide password" : "Show password"}
+                      onClick={() => setShowHostModalPassword((v) => !v)}
+                    >
+                      {showHostModalPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                    </button>
+                  </div>
                 ) : (
                   <>
                     <textarea className="min-h-28 w-full rounded-md border border-input bg-background p-3 text-xs" placeholder="Paste private key" value={draft.privateKey} onChange={(e) => setDraft((prev) => ({ ...prev, privateKey: e.target.value }))} />

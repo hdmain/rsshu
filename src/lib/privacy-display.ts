@@ -68,3 +68,14 @@ export function formatSessionTabLabel(
 export function formatSftpBannerLabel(host: PrivacyHostRef | undefined, fallbackFullLabel: string, privacy: boolean): string {
   return formatSessionTabLabel(host, fallbackFullLabel, privacy);
 }
+
+export function hostPasswordDisplay(
+  host: { authMethod: string; password?: string },
+  privacy: boolean,
+  revealed: boolean,
+): string | null {
+  if (host.authMethod !== "password") return null;
+  if (!host.password) return "(no password saved)";
+  if (privacy) return "[hidden]";
+  return revealed ? host.password : "••••••••";
+}

@@ -251,31 +251,46 @@ export function TerminalView({ tabId, sessionId, onDisconnected, keywordSettings
       term.write(cached);
     }
 
-    const disposeInput = term.onData(async (data) => {
-      try {
-        await invoke("ssh_send_input", { sessionId, input: data });
-      } catch {
+    const disposeInput = term.onData((data) => {
+      void invoke("ssh_send_input", { sessionId, input: data }).catch(() => {
         onDisconnected(tabId);
-      }
+      });
     });
 
-    const timer = window.setInterval(async () => {
-      try {
-        const chunks = await invoke<string[]>("ssh_read_output", { sessionId });
-        for (const chunk of chunks) {
-          const highlighted = highlightChunk(chunk, keywordSettings);
-          const previous = sessionBufferCache.get(sessionId) ?? "";
-          sessionBufferCache.set(sessionId, previous + highlighted);
-          term.write(highlighted);
-        }
-      } catch {
-        onDisconnected(tabId);
-      }
+    let outputRaf = 0;
+    let pendingOutput = "";
+    const flushOutput = () => {
+      outputRaf = 0;
+      if (!pendingOutput) return;
+      const highlighted = highlightChunk(pendingOutput, keywordSettings);
+      pendingOutput = "";
+      const previous = sessionBufferCache.get(sessionId) ?? "";
+      sessionBufferCache.set(sessionId, previous + highlighted);
+      term.write(highlighted);
+    };
+
+    const timer = window.setInterval(() => {
+      void invoke<string[]>("ssh_read_output", { sessionId })
+        .then((chunks) => {
+          if (chunks.length === 0) return;
+          for (const chunk of chunks) {
+            pendingOutput += chunk;
+          }
+          if (!outputRaf) {
+            outputRaf = window.requestAnimationFrame(flushOutput);
+          }
+        })
+        .catch(() => {
+          onDisconnected(tabId);
+        });
     }, 50);
 
     return () => {
       disposeInput.dispose();
       window.clearInterval(timer);
+      if (outputRaf) {
+        window.cancelAnimationFrame(outputRaf);
+      }
     };
   }, [sessionId, tabId, onDisconnected, keywordSettings]);
 

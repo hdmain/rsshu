@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Mutex as AsyncMutex;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -154,7 +155,7 @@ fn connect_ssh<F: Fn(&str) + Send + Sync + 'static>(
 }
 
 struct ShellSession {
-    command_tx: Sender<WorkerCommand>,
+    command_tx: UnboundedSender<WorkerCommand>,
     output_rx: Receiver<String>,
     is_alive: Arc<AtomicBool>,
     ssh_session: Arc<AsyncMutex<SshHandle>>,
@@ -165,6 +166,53 @@ enum WorkerCommand {
     Input(String),
     Resize { cols: u32, rows: u32 },
     Close,
+}
+
+#[derive(PartialEq)]
+enum ShellIoEvent {
+    Continue,
+    Closed,
+}
+
+/// Drain queued keystrokes without starving channel reads (window updates arrive via `wait`).
+async fn drain_shell_input(
+    write: &russh::ChannelWriteHalf<russh::client::Msg>,
+    pending: &mut Vec<u8>,
+) -> Result<(), russh::Error> {
+    while !pending.is_empty() {
+        let writable = write
+            .writable_packet_size()
+            .await
+            .min(pending.len())
+            .min(8192);
+        if writable == 0 {
+            break;
+        }
+        write.data(&pending[..writable]).await?;
+        pending.drain(..writable);
+    }
+    Ok(())
+}
+
+fn forward_channel_msg(msg: ChannelMsg, output_tx: &Sender<String>) -> ShellIoEvent {
+    match msg {
+        ChannelMsg::Data { data } => {
+            let text = String::from_utf8_lossy(&data).to_string();
+            let _ = output_tx.send(text);
+            ShellIoEvent::Continue
+        }
+        ChannelMsg::ExtendedData { data, .. } => {
+            let text = String::from_utf8_lossy(&data).to_string();
+            let _ = output_tx.send(text);
+            ShellIoEvent::Continue
+        }
+        ChannelMsg::Eof => {
+            let _ = output_tx.send("\n[session closed]\n".to_string());
+            ShellIoEvent::Closed
+        }
+        ChannelMsg::Close => ShellIoEvent::Closed,
+        _ => ShellIoEvent::Continue,
+    }
 }
 
 struct ShellSessions {
@@ -272,7 +320,7 @@ async fn ssh_start_shell(
         passphrase: req.passphrase.clone(),
     };
     let app_for_progress = app.clone();
-    let (handle, mut channel) = tauri::async_runtime::spawn_blocking(move || {
+    let (handle, channel) = tauri::async_runtime::spawn_blocking(move || {
         let app_connect = app_for_progress.clone();
         let handle = connect_ssh(&connect_req, move |line| emit_progress(&app_connect, line))
             .map_err(|e| e.to_string())?;
@@ -300,7 +348,7 @@ async fn ssh_start_shell(
     .map_err(|e| format!("SSH connect worker thread failed: {e}"))?
     .map_err(|e| e.to_string())?;
 
-    let (command_tx, command_rx) = mpsc::channel::<WorkerCommand>();
+    let (command_tx, mut command_rx) = tokio::sync::mpsc::unbounded_channel::<WorkerCommand>();
     let (output_tx, output_rx) = mpsc::channel::<String>();
     let is_alive = Arc::new(AtomicBool::new(true));
     let shared_session = Arc::new(AsyncMutex::new(handle));
@@ -318,6 +366,7 @@ async fn ssh_start_shell(
             worker_session_id
         );
         ssh_client::block_on(async move {
+            let (mut read_half, write_half) = channel.split();
             let mut pending_input: Vec<u8> = Vec::new();
             let mut last_keepalive = Instant::now();
             let mut last_input_log = Instant::now();
@@ -325,41 +374,61 @@ async fn ssh_start_shell(
             let mut closed = false;
 
             while !closed {
-                match command_rx.try_recv() {
-                    Ok(WorkerCommand::Close) => {
-                        println!(
-                            "[ssh] close requested session_id={}",
-                            worker_session_id
-                        );
-                        closed = true;
+                if last_keepalive.elapsed() >= Duration::from_secs(10) {
+                    if let Ok(ssh) = worker_ssh.try_lock() {
+                        let _ = ssh.send_keepalive(false).await;
                     }
-                    Ok(WorkerCommand::Resize { cols, rows }) => {
-                        if cols > 0 && rows > 0 {
-                            let _ = channel.window_change(cols, rows, 0, 0).await;
-                        }
-                    }
-                    Ok(WorkerCommand::Input(input)) => {
-                        pending_input.extend_from_slice(input.as_bytes());
-                        input_bytes_since_log += input.len();
-                    }
-                    Err(TryRecvError::Empty) => {}
-                    Err(TryRecvError::Disconnected) => {
-                        closed = true;
-                    }
+                    last_keepalive = Instant::now();
                 }
 
-                if !pending_input.is_empty() {
-                    let max_chunk = pending_input.len().min(1024);
-                    if let Err(err) = channel.data(&pending_input[..max_chunk]).await {
-                        eprintln!(
-                            "[ssh] write failed session_id={} err={}",
-                            worker_session_id, err
-                        );
-                        let _ = output_tx
-                            .send("\n[error] failed to write to shell\n".to_string());
-                        closed = true;
-                    } else {
-                        pending_input.drain(..max_chunk);
+                tokio::select! {
+                    biased;
+
+                    cmd = command_rx.recv() => {
+                        match cmd {
+                            Some(WorkerCommand::Close) => {
+                                println!(
+                                    "[ssh] close requested session_id={}",
+                                    worker_session_id
+                                );
+                                closed = true;
+                            }
+                            Some(WorkerCommand::Resize { cols, rows }) => {
+                                if cols > 0 && rows > 0 {
+                                    let _ = write_half.window_change(cols, rows, 0, 0).await;
+                                }
+                            }
+                            Some(WorkerCommand::Input(input)) => {
+                                pending_input.extend_from_slice(input.as_bytes());
+                                input_bytes_since_log += input.len();
+                            }
+                            None => closed = true,
+                        }
+                    }
+
+                    msg = read_half.wait(), if !closed => {
+                        match msg {
+                            Some(m) => {
+                                if forward_channel_msg(m, &output_tx) == ShellIoEvent::Closed {
+                                    closed = true;
+                                }
+                            }
+                            None => closed = true,
+                        }
+                    }
+
+                    write_result = drain_shell_input(&write_half, &mut pending_input),
+                        if !pending_input.is_empty() && !closed =>
+                    {
+                        if let Err(err) = write_result {
+                            eprintln!(
+                                "[ssh] write failed session_id={} err={}",
+                                worker_session_id, err
+                            );
+                            let _ = output_tx
+                                .send("\n[error] failed to write to shell\n".to_string());
+                            closed = true;
+                        }
                     }
                 }
 
@@ -373,39 +442,9 @@ async fn ssh_start_shell(
                     }
                     last_input_log = Instant::now();
                 }
-
-                let wait = tokio::time::timeout(Duration::from_millis(30), channel.wait());
-                match wait.await {
-                    Ok(Some(ChannelMsg::Data { data })) => {
-                        let text = String::from_utf8_lossy(&data).to_string();
-                        let _ = output_tx.send(text);
-                    }
-                    Ok(Some(ChannelMsg::ExtendedData { data, .. })) => {
-                        let text = String::from_utf8_lossy(&data).to_string();
-                        let _ = output_tx.send(text);
-                    }
-                    Ok(Some(ChannelMsg::Eof)) => {
-                        let _ = output_tx.send("\n[session closed]\n".to_string());
-                        closed = true;
-                    }
-                    Ok(Some(ChannelMsg::Close)) => {
-                        closed = true;
-                    }
-                    Ok(Some(_)) => {}
-                    Ok(None) => {
-                        closed = true;
-                    }
-                    Err(_) => {}
-                }
-
-                if last_keepalive.elapsed() >= Duration::from_secs(10) {
-                    let ssh = worker_ssh.lock().await;
-                    let _ = ssh.send_keepalive(false).await;
-                    last_keepalive = Instant::now();
-                }
             }
 
-            let _ = channel.close().await;
+            let _ = write_half.close().await;
             let ssh = worker_ssh.lock().await;
             let _ = ssh_client::disconnect_async(&ssh, "Client closed shell").await;
         });
