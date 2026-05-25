@@ -34,18 +34,6 @@ No subscriptions. No telemetry. Runs on Linux and Windows. Your credentials stay
 - 🪶 **Native & Lightweight** — Ships as a small native binary. Fast to start, light on resources.
 - 🔄 **Multi-Host Management** — Organize and quickly switch between all your remote servers from one place.
 
----
-
-## 🖼️ Demo / Preview
-
-> A full SSH session with integrated terminal and SFTP file browser.
-
-<div align="center">
-<img src="img/preview.jpg" alt="RSSHU App Preview" width="820" />
-</div>
-
----
-
 ## 🛠️ Tech Stack
 
 | Layer | Technology |
@@ -56,7 +44,7 @@ No subscriptions. No telemetry. Runs on Linux and Windows. Your credentials stay
 | **Terminal** | [xterm.js](https://xtermjs.org) |
 | **Desktop Runtime** | [Tauri 2](https://tauri.app) |
 | **Backend Language** | [Rust](https://www.rust-lang.org) |
-| **SSH / SFTP** | [ssh2](https://crates.io/crates/ssh2) (libssh2 bindings) |
+| **SSH / SFTP** | [russh](https://crates.io/crates/russh) (librussh bindings) |
 | **Encryption** | Argon2 (key derivation) + AES-GCM |
 | **Cloud Sync** | GitHub Gist API (optional) |
 

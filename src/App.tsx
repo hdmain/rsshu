@@ -16,6 +16,7 @@ import {
   Plus,
   Search,
   Server,
+  RefreshCw,
   ShieldCheck,
   Terminal,
   Trash2,
@@ -71,7 +72,7 @@ type SessionTab = {
 };
 type SshProgressPayload = { line: string };
 type Screen = "hosts" | "terminal" | "sftp";
-type HostStatus = "online" | "offline" | "connecting";
+type HostStatus = "checking" | "online" | "offline" | "connecting";
 type SidebarSection = "hosts" | "keychain" | "forwarding" | "snippets" | "known" | "logs" | "settings";
 type TerminalState = "empty" | "connecting" | "connected" | "disconnected" | "error";
 type SftpState = "empty" | "connecting" | "connected" | "error";
@@ -118,16 +119,42 @@ const emptyDraft: HostDraft = {
   tags: "",
 };
 
+function hostStatusLabel(status: HostStatus): string {
+  if (status === "checking" || status === "connecting") return "connecting";
+  if (status === "online") return "connected";
+  return "offline";
+}
+
+function reachabilityLabel(status: HostStatus | undefined): string | null {
+  if (!status) return null;
+  if (status === "checking" || status === "connecting") return "testing…";
+  if (status === "online") return "reachable";
+  return "unreachable";
+}
+
 function statusColor(status: HostStatus) {
   if (status === "online") return "text-emerald-400";
-  if (status === "connecting") return "text-amber-300";
+  if (status === "checking" || status === "connecting") return "text-amber-300";
   return "text-rose-400";
 }
 
 function statusDot(status: HostStatus) {
   if (status === "online") return "bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)]";
-  if (status === "connecting") return "bg-amber-300 shadow-[0_0_8px_rgba(252,211,77,0.8)]";
+  if (status === "checking" || status === "connecting") {
+    return "bg-amber-300 animate-pulse shadow-[0_0_8px_rgba(252,211,77,0.8)]";
+  }
   return "bg-rose-400/80";
+}
+
+function hostConnectReq(host: Host) {
+  return {
+    host: host.host,
+    port: host.port,
+    username: host.username,
+    password: host.password,
+    privateKey: host.privateKey,
+    passphrase: host.passphrase,
+  };
 }
 
 type TopBarProps = {
@@ -212,7 +239,9 @@ function App() {
 
   const [screen, setScreen] = useState<Screen>("hosts");
   const [hosts, setHosts] = useState<Host[]>([]);
-  const [hostStatuses, setHostStatuses] = useState<Record<string, HostStatus>>({});
+  const [connectingHosts, setConnectingHosts] = useState<Record<string, boolean>>({});
+  const [hostReachability, setHostReachability] = useState<Record<string, HostStatus>>({});
+  const [checkingAllHosts, setCheckingAllHosts] = useState(false);
   const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>({});
   const [sidebarSection, setSidebarSection] = useState<SidebarSection>("hosts");
   const [activeHostId, setActiveHostId] = useState<string | null>(null);
@@ -235,6 +264,7 @@ function App() {
   const [vaultBusy, setVaultBusy] = useState(false);
   const [vaultError, setVaultError] = useState("");
   const skipNextSaveRef = useRef(false);
+  const reachabilityProbeGenRef = useRef(0);
   const [terminalKeywordSettings, setTerminalKeywordSettings] = useState<TerminalKeywordSettings>({
     enabled: true,
     colors: {
@@ -405,9 +435,6 @@ function App() {
         const parsed = JSON.parse(json || "[]");
         if (Array.isArray(parsed)) {
           setHosts(parsed as Host[]);
-          setHostStatuses(
-            Object.fromEntries((parsed as Host[]).map((host) => [host.id, "offline" as HostStatus])),
-          );
           setSyncInfo("Startup sync completed (pulled from cloud).");
         }
         setSyncReadyForPush(true);
@@ -432,9 +459,6 @@ function App() {
           const parsed = JSON.parse(poll.payload || "[]");
           if (Array.isArray(parsed)) {
             setHosts(parsed as Host[]);
-            setHostStatuses(
-              Object.fromEntries((parsed as Host[]).map((host) => [host.id, "offline" as HostStatus])),
-            );
             setSyncInfo("Cloud update detected and imported.");
           }
         } catch (err) {
@@ -452,7 +476,8 @@ function App() {
       await invoke("vault_init", { password });
       skipNextSaveRef.current = true;
       setHosts([]);
-      setHostStatuses({});
+      setHostReachability({});
+      setConnectingHosts({});
       setVaultStatus("unlocked");
     } catch (err) {
       setVaultError(String(err));
@@ -477,7 +502,6 @@ function App() {
       }
       skipNextSaveRef.current = true;
       setHosts(parsed);
-      setHostStatuses(Object.fromEntries(parsed.map((host) => [host.id, "offline" as HostStatus])));
       setVaultStatus("unlocked");
     } catch (err) {
       setVaultError(String(err));
@@ -510,7 +534,8 @@ function App() {
     }
     skipNextSaveRef.current = true;
     setHosts([]);
-    setHostStatuses({});
+    setHostReachability({});
+    setConnectingHosts({});
     setTabs([]);
     setActiveTabId(null);
     setTerminalState("empty");
@@ -571,9 +596,6 @@ function App() {
       const parsed = JSON.parse(json || "[]");
       if (Array.isArray(parsed)) {
         setHosts(parsed as Host[]);
-        setHostStatuses(
-          Object.fromEntries((parsed as Host[]).map((host) => [host.id, "offline" as HostStatus])),
-        );
       }
       setSyncInfo("Pulled latest data from GitHub Gist.");
     } catch (err) {
@@ -602,6 +624,70 @@ function App() {
       return acc;
     }, {});
   }, [filteredHosts]);
+
+  const hostConnectionStatus = useMemo(() => {
+    const map: Record<string, HostStatus> = {};
+    for (const host of hosts) {
+      if (connectingHosts[host.id]) {
+        map[host.id] = "checking";
+      } else if (
+        tabs.some((t) => t.hostId === host.id && t.sessionId && !t.disconnected) ||
+        (sftpSession?.hostId === host.id && sftpState === "connected")
+      ) {
+        map[host.id] = "online";
+      } else {
+        map[host.id] = "offline";
+      }
+    }
+    return map;
+  }, [hosts, connectingHosts, tabs, sftpSession, sftpState]);
+
+  const setHostConnecting = useCallback((hostId: string, connecting: boolean) => {
+    setConnectingHosts((prev) => {
+      if (connecting) return { ...prev, [hostId]: true };
+      const next = { ...prev };
+      delete next[hostId];
+      return next;
+    });
+  }, []);
+
+  const checkAllHostsReachability = useCallback(async (hostList: Host[]) => {
+    if (hostList.length === 0) return;
+    const gen = ++reachabilityProbeGenRef.current;
+    setCheckingAllHosts(true);
+    setHostReachability((prev) => {
+      const next = { ...prev };
+      for (const h of hostList) next[h.id] = "checking";
+      return next;
+    });
+
+    const pending = [...hostList];
+    try {
+      while (pending.length > 0) {
+        if (reachabilityProbeGenRef.current !== gen) return;
+        const batch = pending.splice(0, 3);
+        await Promise.all(
+          batch.map(async (host) => {
+            if (reachabilityProbeGenRef.current !== gen) return;
+            try {
+              await invoke("ssh_test_connection", { req: hostConnectReq(host) });
+              if (reachabilityProbeGenRef.current === gen) {
+                setHostReachability((prev) => ({ ...prev, [host.id]: "online" }));
+              }
+            } catch {
+              if (reachabilityProbeGenRef.current === gen) {
+                setHostReachability((prev) => ({ ...prev, [host.id]: "offline" }));
+              }
+            }
+          }),
+        );
+      }
+    } finally {
+      if (reachabilityProbeGenRef.current === gen) {
+        setCheckingAllHosts(false);
+      }
+    }
+  }, []);
 
   const activeHost = useMemo(
     () => hosts.find((item) => item.id === activeHostId) ?? filteredHosts[0] ?? null,
@@ -849,14 +935,13 @@ function App() {
       if (!draft.id) return [nextHost, ...prev];
       return prev.map((item) => (item.id === draft.id ? nextHost : item));
     });
-    setHostStatuses((prev) => ({ ...prev, [nextHost.id]: prev[nextHost.id] ?? "offline" }));
     setActiveHostId(nextHost.id);
     setIsHostModalOpen(false);
   }
 
   function deleteHost(hostId: string) {
     setHosts((prev) => prev.filter((item) => item.id !== hostId));
-    setHostStatuses((prev) => {
+    setHostReachability((prev) => {
       const next = { ...prev };
       delete next[hostId];
       return next;
@@ -870,21 +955,12 @@ function App() {
   }
 
   async function testConnection(host: Host) {
-    setHostStatuses((prev) => ({ ...prev, [host.id]: "connecting" }));
+    setHostReachability((prev) => ({ ...prev, [host.id]: "connecting" }));
     try {
-      await invoke("ssh_test_connection", {
-        req: {
-          host: host.host,
-          port: host.port,
-          username: host.username,
-          password: host.password,
-          privateKey: host.privateKey,
-          passphrase: host.passphrase,
-        },
-      });
-      setHostStatuses((prev) => ({ ...prev, [host.id]: "online" }));
+      await invoke("ssh_test_connection", { req: hostConnectReq(host) });
+      setHostReachability((prev) => ({ ...prev, [host.id]: "online" }));
     } catch {
-      setHostStatuses((prev) => ({ ...prev, [host.id]: "offline" }));
+      setHostReachability((prev) => ({ ...prev, [host.id]: "offline" }));
     }
   }
 
@@ -893,7 +969,6 @@ function App() {
       const tab = tabs.find((t) => t.id === tabId);
       if (!tab?.sessionId) return;
       const sid = tab.sessionId;
-      const hid = tab.hostId;
       clearTerminalSessionCache(sid);
       void invoke("ssh_close_shell", { sessionId: sid }).catch(() => {});
       setTabs((prev) =>
@@ -912,7 +987,6 @@ function App() {
       if (activeTabId === tabId) {
         setTerminalState("disconnected");
       }
-      setHostStatuses((prev) => ({ ...prev, [hid]: "offline" }));
     },
     [tabs, activeTabId]
   );
@@ -923,7 +997,7 @@ function App() {
     setReconnectError("");
     setTerminalState("connecting");
     setTerminalError("");
-    setHostStatuses((prev) => ({ ...prev, [host.id]: "connecting" }));
+    setHostConnecting(host.id, true);
     setIsLoading(true);
     try {
       unlisten = await listen<SshProgressPayload>("ssh-connection-progress", (event) => {
@@ -971,7 +1045,6 @@ function App() {
         setActiveTabId(tab.id);
       }
       setTerminalState("connected");
-      setHostStatuses((prev) => ({ ...prev, [host.id]: "online" }));
     } catch (error) {
       const msg = String(error);
       if (existingTabId) {
@@ -981,8 +1054,8 @@ function App() {
         setTerminalState("error");
         setTerminalError(msg);
       }
-      setHostStatuses((prev) => ({ ...prev, [host.id]: "offline" }));
     } finally {
+      setHostConnecting(host.id, false);
       unlisten?.();
       setIsLoading(false);
     }
@@ -1015,6 +1088,7 @@ function App() {
     setSftpState("connecting");
     setSftpError("");
     setSftpSession(null);
+    setHostConnecting(host.id, true);
     try {
       const response = await invoke<SftpConnectResponse>("sftp_connect", {
         req: {
@@ -1036,6 +1110,8 @@ function App() {
     } catch (error) {
       setSftpError(String(error));
       setSftpState("error");
+    } finally {
+      setHostConnecting(host.id, false);
     }
   }
 
@@ -1126,6 +1202,18 @@ function App() {
                   placeholder="Search host, tag, group"
                 />
               </div>
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={checkingAllHosts || hosts.length === 0}
+                onClick={() => void checkAllHostsReachability(hosts)}
+                title="SSH test every host (reachability only)"
+              >
+                <RefreshCw
+                  className={`mr-1.5 h-3.5 w-3.5 ${checkingAllHosts ? "animate-spin" : ""}`}
+                />
+                Check all
+              </Button>
               <Button size="sm" onClick={openNewHostModal}>
                 <Plus className="mr-1.5 h-3.5 w-3.5" />
                 New Host
@@ -1230,7 +1318,9 @@ function App() {
                       {!collapsedGroups[groupName] ? (
                         <div className="divide-y divide-white/5 border-t border-white/5">
                           {list.map((host) => {
-                            const hostStatus = hostStatuses[host.id] ?? "offline";
+                            const hostStatus = hostConnectionStatus[host.id] ?? "offline";
+                            const reachStatus = hostReachability[host.id];
+                            const reachLabel = reachabilityLabel(reachStatus);
                             const passwordLabel = hostPasswordDisplay(
                               host,
                               privacyRedactHosts,
@@ -1294,8 +1384,11 @@ function App() {
                                   ) : null}
                                 </div>
                                 <div className="ml-2 flex items-center gap-2">
-                                  <span className={`hidden text-xs sm:inline ${statusColor(hostStatus)}`}>
-                                    {hostStatus}
+                                  <span className={`hidden text-xs capitalize sm:inline ${statusColor(hostStatus)}`}>
+                                    {hostStatusLabel(hostStatus)}
+                                    {reachLabel ? (
+                                      <span className="normal-case text-slate-500"> · {reachLabel}</span>
+                                    ) : null}
                                   </span>
                                   <Button size="sm" onClick={() => void connectHost(host)}>
                                     Connect
@@ -1313,7 +1406,7 @@ function App() {
                                     variant="outline"
                                     disabled={isLoading}
                                     onClick={() => void testConnection(host)}
-                                    title="Test connection"
+                                    title="Test SSH reachability (does not open a session)"
                                   >
                                     <ShieldCheck className="h-4 w-4" />
                                   </Button>

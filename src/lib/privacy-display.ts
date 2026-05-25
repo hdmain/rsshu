@@ -42,14 +42,14 @@ export function redactConnectionLogLine(line: string, hosts: PrivacyHostRef[], e
 export function hostCardTitle(host: PrivacyHostRef, privacy: boolean): string {
   if (!privacy) return host.name;
   if (hasIpv4(host.name) || host.name.trim().toLowerCase() === host.host.trim().toLowerCase()) {
-    return "Host [hidden]";
+    return "Host";
   }
   return host.name;
 }
 
 export function hostCardSubtitle(host: PrivacyHostRef, privacy: boolean): string {
   if (!privacy) return `${host.username}@${host.host}:${host.port}`;
-  return `${host.username} · [address hidden]`;
+  return host.username;
 }
 
 export function formatSessionTabLabel(
@@ -60,9 +60,10 @@ export function formatSessionTabLabel(
   if (!privacy) {
     return host ? `${host.name} (${host.username}@${host.host})` : fallbackFullLabel;
   }
-  if (!host) return "Session [hidden]";
+  if (!host) return "Session";
   const title = hostCardTitle(host, true);
-  return `${title} (${host.username} @ [hidden])`;
+  if (title === "Host") return `${title} · ${host.username}`;
+  return title;
 }
 
 export function formatSftpBannerLabel(host: PrivacyHostRef | undefined, fallbackFullLabel: string, privacy: boolean): string {
@@ -76,6 +77,6 @@ export function hostPasswordDisplay(
 ): string | null {
   if (host.authMethod !== "password") return null;
   if (!host.password) return "(no password saved)";
-  if (privacy) return "[hidden]";
+  if (privacy) return null;
   return revealed ? host.password : "••••••••";
 }
