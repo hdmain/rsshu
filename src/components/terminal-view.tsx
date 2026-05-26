@@ -78,6 +78,10 @@ export function TerminalView({ tabId, sessionId, onDisconnected, keywordSettings
   const fitAddonRef = useRef<FitAddon | null>(null);
   const lastSizeRef = useRef<{ cols: number; rows: number } | null>(null);
   const activeSessionIdRef = useRef<string | null>(null);
+  const suppressNextPasteEventRef = useRef(false);
+  const suppressPasteResetTimerRef = useRef<number | null>(null);
+  const lastClipboardPayloadRef = useRef<string>("");
+  const lastClipboardAtRef = useRef(0);
 
   useEffect(() => {
     const term = terminalRef.current;
@@ -134,6 +138,70 @@ export function TerminalView({ tabId, sessionId, onDisconnected, keywordSettings
     term.loadAddon(imageAddon);
     term.open(hostRef.current);
 
+    const sendClipboardToPty = (text: string) => {
+      const activeSessionId = activeSessionIdRef.current;
+      if (!activeSessionId || !text) return;
+      const now = Date.now();
+      // Guard against duplicate browser/terminal paste paths firing together.
+      if (text === lastClipboardPayloadRef.current && now - lastClipboardAtRef.current < 400) {
+        return;
+      }
+      lastClipboardPayloadRef.current = text;
+      lastClipboardAtRef.current = now;
+      void invoke("ssh_send_input", { sessionId: activeSessionId, input: text });
+    };
+
+    term.attachCustomKeyEventHandler((e) => {
+      const key = e.key.toLowerCase();
+      const isCtrlPaste = e.ctrlKey && !e.shiftKey && !e.altKey && key === "v";
+      const isShiftInsertPaste = e.shiftKey && !e.ctrlKey && !e.altKey && e.key === "Insert";
+      if (!isCtrlPaste && !isShiftInsertPaste) return true;
+      e.preventDefault();
+      e.stopPropagation();
+      suppressNextPasteEventRef.current = true;
+      if (suppressPasteResetTimerRef.current) {
+        window.clearTimeout(suppressPasteResetTimerRef.current);
+      }
+      suppressPasteResetTimerRef.current = window.setTimeout(() => {
+        suppressNextPasteEventRef.current = false;
+        suppressPasteResetTimerRef.current = null;
+      }, 1000);
+      void readText()
+        .then((text) => sendClipboardToPty(text))
+        .catch(() => {
+          // ignore
+        });
+      return false;
+    });
+
+    const onPaste = (event: ClipboardEvent) => {
+      const activeSessionId = activeSessionIdRef.current;
+      if (!activeSessionId) return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (suppressNextPasteEventRef.current) {
+        suppressNextPasteEventRef.current = false;
+        if (suppressPasteResetTimerRef.current) {
+          window.clearTimeout(suppressPasteResetTimerRef.current);
+          suppressPasteResetTimerRef.current = null;
+        }
+        return;
+      }
+      const text = event.clipboardData?.getData("text");
+      if (text) {
+        sendClipboardToPty(text);
+        return;
+      }
+      void readText()
+        .then((fallbackText) => {
+          if (fallbackText) sendClipboardToPty(fallbackText);
+        })
+        .catch(() => {
+          // ignore
+        });
+    };
+    hostRef.current.addEventListener("paste", onPaste, { capture: true });
+
     // WebGL renderer — GPU-accelerated, sharpest text + graphics.
     // Falls back silently if WebGL is unavailable (e.g. in software rendering).
     let webglAddon: WebglAddon | null = null;
@@ -148,19 +216,6 @@ export function TerminalView({ tabId, sessionId, onDisconnected, keywordSettings
     } catch {
       // GPU unavailable — DOM renderer will be used automatically.
     }
-
-    term.attachCustomKeyEventHandler((e) => {
-      if (e.ctrlKey && e.key.toLowerCase() === "v") {
-        e.preventDefault();
-        void readText()
-          .then((text: string) => term.paste(text))
-          .catch(() => {
-            // ignore
-          });
-        return false;
-      }
-      return true;
-    });
 
     const safeFit = () => {
       try {
@@ -203,6 +258,11 @@ export function TerminalView({ tabId, sessionId, onDisconnected, keywordSettings
     }
 
     return () => {
+      hostRef.current?.removeEventListener("paste", onPaste, { capture: true });
+      if (suppressPasteResetTimerRef.current) {
+        window.clearTimeout(suppressPasteResetTimerRef.current);
+        suppressPasteResetTimerRef.current = null;
+      }
       setTerminalClipboardBridge(null);
       window.removeEventListener("resize", onResize);
       observer?.disconnect();
