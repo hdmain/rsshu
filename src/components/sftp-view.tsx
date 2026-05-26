@@ -638,21 +638,21 @@ export function SftpView({
     <div className="flex min-h-0 min-w-0 flex-1 flex-row">
       <div
         ref={dropZoneRef}
-        className={`relative flex min-h-0 min-w-0 flex-1 flex-col bg-[#050912] ${
-          dragOver ? "ring-2 ring-inset ring-sky-500/50" : ""
+        className={`app-surface relative flex min-h-0 min-w-0 flex-1 flex-col ${
+          dragOver ? "ring-2 ring-inset ring-[rgb(var(--app-accent)/0.5)]" : ""
         }`}
       >
         {dragOver ? (
           <div
-            className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center bg-sky-500/[0.07]"
+            className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center bg-[rgb(var(--app-accent)/0.07)]"
             aria-hidden
           >
-            <p className="rounded-md border border-sky-400/35 bg-[#0a1120]/95 px-4 py-2 text-sm font-medium text-sky-100 shadow-lg">
+            <p className="app-banner-info rounded-md border bg-card/95 px-4 py-2 text-sm font-medium shadow-lg">
               Drop files to upload to this folder
             </p>
           </div>
         ) : null}
-        <div className="flex items-center gap-2 border-b border-white/10 bg-[#070c18]/80 px-3 py-2">
+        <div className="app-sidebar flex items-center gap-2 border-b px-3 py-2">
           <Button size="sm" variant="ghost" onClick={() => void goHome()} title="Home">
             <HomeIcon className="h-4 w-4" />
           </Button>
@@ -667,19 +667,19 @@ export function SftpView({
           >
             <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
           </Button>
-          <div className="mx-1 h-5 w-px bg-white/10" />
-          <div className="flex min-w-0 flex-1 items-center overflow-x-auto text-xs text-slate-300">
+          <div className="app-chrome-border mx-1 h-5 w-px bg-[currentColor]" />
+          <div className="app-text-muted flex min-w-0 flex-1 items-center overflow-x-auto text-xs">
             <button
-              className="rounded px-1.5 py-0.5 text-slate-400 hover:bg-white/5 hover:text-white"
+              className="app-soft-hover rounded px-1.5 py-0.5"
               onClick={() => void load("/")}
             >
               /
             </button>
             {breadcrumbs.map((seg, idx) => (
               <span key={`${seg}-${idx}`} className="flex items-center">
-                <ChevronRight className="mx-0.5 h-3 w-3 text-slate-500" />
+                <ChevronRight className="app-icon-muted mx-0.5 h-3 w-3" />
                 <button
-                  className="rounded px-1.5 py-0.5 hover:bg-white/5 hover:text-white"
+                  className="app-soft-hover rounded px-1.5 py-0.5"
                   onClick={() => void navigateToSegment(idx)}
                 >
                   {seg}
@@ -688,7 +688,7 @@ export function SftpView({
             ))}
           </div>
           <div className="ml-auto flex shrink-0 items-center gap-2">
-            <span className="hidden text-xs text-slate-500 md:inline">{hostLabel}</span>
+            <span className="app-text-muted hidden text-xs md:inline">{hostLabel}</span>
             <Button size="sm" variant="outline" onClick={() => void onUpload()}>
               <Upload className="mr-1.5 h-3.5 w-3.5" />
               Upload
@@ -704,17 +704,17 @@ export function SftpView({
         </div>
 
         {error ? (
-          <div className="border-b border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-200">
+          <div className="border-b border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
             {error}
           </div>
         ) : null}
 
         {transfer ? (
           <div
-            className="flex items-center gap-2 border-b border-sky-500/25 bg-sky-500/10 px-3 py-1.5 text-xs text-sky-100"
+            className="app-banner-info flex items-center gap-2 border-b px-3 py-1.5 text-xs"
             role="status"
           >
-            <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-sky-300" />
+            <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
             <span>
               {transfer.kind === "upload"
                 ? "Uploading"
@@ -728,7 +728,7 @@ export function SftpView({
           </div>
         ) : null}
 
-        <div className="grid grid-cols-[1fr_120px_200px_100px_120px] gap-x-2 border-b border-white/5 bg-white/[0.02] px-3 py-1.5 text-[10px] uppercase tracking-wider text-slate-500">
+        <div className="app-card app-soft app-text-muted grid grid-cols-[1fr_120px_200px_100px_120px] gap-x-2 border-b px-3 py-1.5 text-[10px] uppercase tracking-wider">
           <span>Name</span>
           <span className="text-right">Size</span>
           <span>Modified</span>
@@ -738,19 +738,19 @@ export function SftpView({
 
         <div className="min-h-0 flex-1 overflow-y-auto">
           {loading && entries.length === 0 ? (
-            <div className="flex h-full items-center justify-center text-slate-400">
+            <div className="app-text-muted flex h-full items-center justify-center">
               <Loader2 className="mr-2 h-4 w-4 animate-spin" />
               Loading…
             </div>
           ) : null}
 
           {!loading && entries.length === 0 && !error ? (
-            <div className="flex h-full items-center justify-center text-sm text-slate-500">
+            <div className="app-text-muted flex h-full items-center justify-center text-sm">
               Empty directory
             </div>
           ) : null}
           {!loading && entries.length > 0 && visibleEntries.length === 0 && !error ? (
-            <div className="flex h-full items-center justify-center px-4 text-center text-sm text-slate-500">
+            <div className="app-text-muted flex h-full items-center justify-center px-4 text-center text-sm">
               All items are hidden (names start with “.”). Change this in Settings.
             </div>
           ) : null}
@@ -760,30 +760,30 @@ export function SftpView({
             return (
               <div
                 key={entry.path}
-                className="grid cursor-default grid-cols-[1fr_120px_200px_100px_120px] items-center gap-x-2 border-b border-white/[0.03] px-3 py-1.5 text-xs transition hover:bg-white/[0.04]"
+                className="grid cursor-default grid-cols-[1fr_120px_200px_100px_120px] items-center gap-x-2 border-b border-border/40 px-3 py-1.5 text-xs transition app-soft-hover"
                 onDoubleClick={() => void onOpenFile(entry)}
               >
                 <div className="flex min-w-0 items-center gap-2 truncate">
                   {entry.is_dir ? (
-                    <FolderIcon className="h-4 w-4 shrink-0 text-sky-300" />
+                    <FolderIcon className="app-icon-accent h-4 w-4 shrink-0" />
                   ) : (
-                    <FileIcon className="h-4 w-4 shrink-0 text-slate-400" />
+                    <FileIcon className="app-icon-muted h-4 w-4 shrink-0" />
                   )}
                   <button
                     type="button"
-                    className="truncate text-left text-slate-100 hover:text-sky-200"
+                    className="app-text-strong truncate text-left hover:app-accent-text"
                     onClick={() => void onOpenEntry(entry)}
                     title={entry.path}
                   >
                     {entry.name}
-                    {entry.is_symlink ? <span className="ml-1 text-slate-500">→</span> : null}
+                    {entry.is_symlink ? <span className="app-text-muted ml-1">→</span> : null}
                   </button>
                 </div>
-                <span className="text-right text-slate-300">
+                <span className="app-text-muted text-right">
                   {formatSize(entry.size, entry.is_dir)}
                 </span>
-                <span className="truncate text-slate-400">{formatMtime(entry.mtime)}</span>
-                <span className="font-mono text-[11px] text-slate-500">
+                <span className="app-text-muted truncate">{formatMtime(entry.mtime)}</span>
+                <span className="app-text-muted font-mono text-[11px]">
                   {(entry.perm & 0o777).toString(8).padStart(3, "0")}
                 </span>
                 <div
@@ -792,7 +792,7 @@ export function SftpView({
                 >
                   <button
                     type="button"
-                    className="rounded p-1 text-slate-400 hover:bg-white/10 hover:text-amber-200"
+                    className="app-icon-muted app-soft-hover rounded p-1 hover:text-amber-300"
                     onClick={() => void onRename(entry)}
                     disabled={busy}
                     title="Rename"
@@ -806,7 +806,7 @@ export function SftpView({
                   {!entry.is_dir ? (
                     <button
                       type="button"
-                      className="rounded p-1 text-slate-400 hover:bg-white/10 hover:text-white disabled:opacity-50"
+                      className="app-icon-muted app-soft-hover rounded p-1 hover:text-foreground disabled:opacity-50"
                       onClick={() => void onDownload(entry)}
                       disabled={busy}
                       title="Download"
@@ -820,7 +820,7 @@ export function SftpView({
                   ) : null}
                   <button
                     type="button"
-                    className="rounded p-1 text-slate-400 hover:bg-white/10 hover:text-rose-300"
+                    className="app-icon-muted app-soft-hover rounded p-1 hover:text-rose-300"
                     onClick={() => void onDelete(entry)}
                     disabled={busy}
                     title="Delete"
@@ -835,10 +835,10 @@ export function SftpView({
       </div>
 
       {trackedOpen.length > 0 ? (
-        <aside className="flex w-64 shrink-0 flex-col border-l border-white/10 bg-[#070c18]/90">
-          <div className="border-b border-white/10 px-2 py-2">
-            <p className="text-xs font-medium text-slate-200">External editor</p>
-            <p className="mt-0.5 text-[10px] leading-snug text-slate-500">
+        <aside className="app-sidebar flex w-64 shrink-0 flex-col border-l">
+          <div className="border-b border-border px-2 py-2">
+            <p className="app-text-strong text-xs font-medium">External editor</p>
+            <p className="app-text-muted mt-0.5 text-[10px] leading-snug">
               {openEditMode === "auto"
                 ? "Saves to the server shortly after the file on disk changes."
                 : "Click Save in this list to upload your edits to the server."}
@@ -848,22 +848,22 @@ export function SftpView({
             {trackedOpen.map((t) => (
               <li
                 key={t.id}
-                className="mb-1.5 rounded-md border border-white/10 bg-white/[0.04] p-1.5 text-[11px] text-slate-300"
+                className="app-card app-soft app-text-muted mb-1.5 rounded-md p-1.5 text-[11px]"
               >
                 <div className="flex items-start justify-between gap-1">
-                  <span className="min-w-0 flex-1 truncate font-medium text-slate-200" title={t.name}>
+                  <span className="app-text-strong min-w-0 flex-1 truncate font-medium" title={t.name}>
                     {t.name}
                   </span>
                   <button
                     type="button"
-                    className="shrink-0 rounded p-0.5 text-slate-500 hover:bg-white/10 hover:text-slate-200"
+                    className="app-icon-muted app-soft-hover shrink-0 rounded p-0.5"
                     onClick={() => dismissTracked(t.id)}
                     title="Remove from list"
                   >
                     <X className="h-3 w-3" />
                   </button>
                 </div>
-                <p className="mt-0.5 text-[10px] text-slate-500">
+                <p className="app-text-muted mt-0.5 text-[10px]">
                   {t.editState === "uploading"
                     ? "Uploading…"
                     : t.editState === "modified"

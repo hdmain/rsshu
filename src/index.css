@@ -1,24 +1,3 @@
-:root {
-  --background: 222 47% 5%;
-  --foreground: 210 40% 98%;
-  --card: 222 47% 8%;
-  --card-foreground: 210 40% 98%;
-  --primary: 199 89% 48%;
-  --primary-foreground: 222 47% 5%;
-  --secondary: 217 32% 15%;
-  --secondary-foreground: 210 40% 96%;
-  --muted: 217 32% 15%;
-  --muted-foreground: 215 20% 65%;
-  --accent: 217 32% 19%;
-  --accent-foreground: 210 40% 98%;
-  --destructive: 0 72% 51%;
-  --destructive-foreground: 210 40% 98%;
-  --border: 217 32% 20%;
-  --input: 217 32% 20%;
-  --ring: 199 89% 48%;
-  --radius: 0.65rem;
-}
-
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -36,4 +15,224 @@
   #root {
     @apply min-h-screen;
   }
+}
+
+@layer components {
+  .app-shell {
+    background: var(--app-shell);
+    @apply text-foreground;
+  }
+
+  .app-vault-screen {
+    background: var(--app-vault-bg);
+  }
+
+  .app-header {
+    background: var(--app-header);
+    border-color: rgb(var(--app-chrome-border));
+    @apply border-b backdrop-blur;
+  }
+
+  .app-title-bar {
+    background: var(--app-title-bar);
+    border-color: rgb(var(--app-chrome-border));
+    color: rgb(var(--app-chrome-fg));
+    @apply border-b backdrop-blur;
+  }
+
+  .app-sidebar {
+    background: var(--app-sidebar);
+    border-color: rgb(var(--app-chrome-border));
+    @apply border-r backdrop-blur;
+  }
+
+  .app-surface {
+    background: var(--app-surface);
+  }
+
+  .app-panel {
+    background: var(--app-panel);
+    border-color: rgb(var(--app-chrome-border));
+  }
+
+  .app-modal {
+    background: var(--app-modal);
+    border-color: rgb(var(--app-chrome-border));
+  }
+
+  .app-chrome-muted {
+    color: rgb(var(--app-chrome-fg) / 0.65);
+  }
+
+  .app-chrome-text {
+    color: rgb(var(--app-chrome-fg));
+  }
+
+  .app-accent-text {
+    color: rgb(var(--app-accent));
+  }
+
+  .app-accent-bg {
+    background: var(--app-accent-soft);
+    color: rgb(var(--app-accent));
+  }
+
+  .app-nav-active {
+    background: var(--app-accent-soft);
+    color: rgb(var(--app-accent));
+    box-shadow: 0 0 0 1px rgb(var(--app-accent) / 0.2);
+  }
+
+  .app-chrome-border {
+    border-color: rgb(var(--app-chrome-border));
+  }
+
+  .app-chrome-hover:hover {
+    background: rgb(var(--app-chrome-border));
+    color: rgb(var(--app-chrome-fg));
+  }
+
+  .app-card {
+    @apply border app-chrome-border bg-card/40;
+  }
+
+  .app-soft {
+    @apply bg-muted/40;
+  }
+
+  .app-soft-hover:hover {
+    @apply bg-muted/60;
+  }
+
+  .app-text-strong {
+    @apply text-foreground;
+  }
+
+  .app-text-muted {
+    @apply text-muted-foreground;
+  }
+
+  .app-icon-accent {
+    color: rgb(var(--app-accent));
+  }
+
+  .app-icon-muted {
+    @apply text-muted-foreground;
+  }
+
+  .app-toggle-on {
+    background: rgb(var(--app-accent));
+  }
+
+  .app-toggle-off {
+    @apply bg-muted;
+  }
+
+  .app-banner-info {
+    border-color: rgb(var(--app-accent) / 0.35);
+    background: rgb(var(--app-accent) / 0.12);
+    color: rgb(var(--app-accent));
+  }
+}
+
+/* Light theme: remap hardcoded slate utilities used across the app */
+.theme-light .text-slate-100,
+.theme-light .text-slate-200 {
+  @apply text-foreground;
+}
+
+.theme-light .text-slate-300,
+.theme-light .text-slate-400,
+.theme-light .text-slate-500 {
+  @apply text-muted-foreground;
+}
+
+.theme-light .border-white\/10,
+.theme-light .border-white\/5 {
+  @apply border-border;
+}
+
+.theme-light .bg-white\/5,
+.theme-light .bg-white\/\[0\.03\],
+.theme-light .bg-white\/\[0\.04\],
+.theme-light .bg-white\/\[0\.06\] {
+  @apply bg-muted/60;
+}
+
+.theme-light .divide-white\/5 > :not([hidden]) ~ :not([hidden]) {
+  @apply divide-border;
+}
+
+.theme-light .hover\:bg-white\/5:hover,
+.theme-light .hover\:bg-white\/\[0\.03\]:hover,
+.theme-light .hover\:bg-white\/\[0\.04\]:hover,
+.theme-light .hover\:bg-white\/\[0\.06\]:hover,
+.theme-light .hover\:bg-white\/10:hover {
+  @apply hover:bg-muted;
+}
+
+.theme-light .bg-\[\#050912\],
+.theme-light .bg-\[\#070c18\],
+.theme-light .bg-\[\#070c18\]\/70,
+.theme-light .bg-\[\#070c18\]\/80,
+.theme-light .bg-\[\#070c18\]\/95,
+.theme-light .bg-\[\#0a1120\],
+.theme-light .bg-\[\#1f2740\]\/80 {
+  @apply bg-background;
+}
+
+.theme-light .from-\[\#0a1120\],
+.theme-light .via-\[\#0b1326\],
+.theme-light .to-\[\#0a1120\] {
+  --tw-gradient-from: hsl(var(--background));
+  --tw-gradient-to: hsl(var(--muted));
+  --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to);
+}
+
+/* Crisp, high-contrast terminal text */
+.xterm {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+.xterm .xterm-screen {
+  font-weight: 450;
+}
+
+/* Theme normalization: replace leftover hardcoded sky/slate utilities
+   with current theme tokens to keep icons/text consistent. */
+[data-theme]:not([data-theme="default"]) .text-slate-100,
+[data-theme]:not([data-theme="default"]) .text-slate-200 {
+  color: hsl(var(--foreground));
+}
+
+[data-theme]:not([data-theme="default"]) .text-slate-300,
+[data-theme]:not([data-theme="default"]) .text-slate-400,
+[data-theme]:not([data-theme="default"]) .text-slate-500,
+[data-theme]:not([data-theme="default"]) .text-slate-600 {
+  color: hsl(var(--muted-foreground));
+}
+
+[data-theme] .text-sky-100,
+[data-theme] .text-sky-200,
+[data-theme] .text-sky-300,
+[data-theme] .text-sky-400 {
+  color: rgb(var(--app-accent));
+}
+
+[data-theme] .bg-sky-500\/10,
+[data-theme] .bg-sky-500\/15,
+[data-theme] .bg-sky-500\/20,
+[data-theme] .bg-sky-500\/30 {
+  background: var(--app-accent-soft);
+}
+
+[data-theme] .border-sky-400\/40,
+[data-theme] .border-sky-500\/25,
+[data-theme] .border-sky-500\/40 {
+  border-color: rgb(var(--app-accent) / 0.4);
+}
+
+[data-theme] .ring-sky-500\/20 {
+  --tw-ring-color: rgb(var(--app-accent) / 0.2);
 }

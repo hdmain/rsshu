@@ -171,7 +171,7 @@ export function GlobalContextMenu() {
   return (
     <div
       data-app-context-menu
-      className="fixed z-[10000] min-w-[12rem] overflow-hidden rounded-md border border-white/10 bg-[#0a1120] py-1 text-sm shadow-lg shadow-black/50"
+      className="app-modal app-text-strong fixed z-[10000] min-w-[12rem] overflow-hidden rounded-md border py-1 text-sm shadow-lg shadow-black/50"
       style={{ left, top }}
       role="menu"
       onMouseDown={(e) => e.stopPropagation()}
@@ -181,30 +181,30 @@ export function GlobalContextMenu() {
         role="menuitem"
         disabled={copyEmpty || (inX && !br)}
         onClick={() => void doCopy()}
-        className="flex w-full items-center justify-between gap-6 px-3 py-1.5 text-left text-slate-200 transition hover:bg-white/5 disabled:cursor-not-allowed disabled:opacity-40"
+        className="app-soft-hover flex w-full items-center justify-between gap-6 px-3 py-1.5 text-left transition disabled:cursor-not-allowed disabled:opacity-40"
       >
         <span className="flex-1">Kopiuj</span>
-        {showShortcuts ? <span className="text-[10px] text-slate-500">Ctrl+C</span> : null}
+        {showShortcuts ? <span className="app-text-muted text-[10px]">Ctrl+C</span> : null}
       </button>
       <button
         type="button"
         role="menuitem"
         disabled={inX ? pasteDisabled : fieldReadonly}
         onClick={() => void doPaste()}
-        className="flex w-full items-center justify-between gap-6 px-3 py-1.5 text-left text-slate-200 transition hover:bg-white/5 disabled:cursor-not-allowed disabled:opacity-40"
+        className="app-soft-hover flex w-full items-center justify-between gap-6 px-3 py-1.5 text-left transition disabled:cursor-not-allowed disabled:opacity-40"
       >
         <span className="flex-1">Wklej</span>
-        {showShortcuts ? <span className="text-[10px] text-slate-500">Ctrl+V</span> : null}
+        {showShortcuts ? <span className="app-text-muted text-[10px]">Ctrl+V</span> : null}
       </button>
       <button
         type="button"
         role="menuitem"
         disabled={fieldReadonly || deleteXtermDisabled || (inX && !br)}
         onClick={doDelete}
-        className="flex w-full items-center justify-between gap-6 px-3 py-1.5 text-left text-slate-200 transition hover:bg-white/5 disabled:cursor-not-allowed disabled:opacity-40"
+        className="app-soft-hover flex w-full items-center justify-between gap-6 px-3 py-1.5 text-left transition disabled:cursor-not-allowed disabled:opacity-40"
       >
         <span className="flex-1">Usuń</span>
-        {showShortcuts ? <span className="text-[10px] text-slate-500">Del</span> : null}
+        {showShortcuts ? <span className="app-text-muted text-[10px]">Del</span> : null}
       </button>
     </div>
   );

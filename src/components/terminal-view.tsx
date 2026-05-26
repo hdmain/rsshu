@@ -1,4 +1,6 @@
 import { useEffect, useRef } from "react";
+import { getTerminalTheme } from "@/lib/themes";
+import { useTheme } from "@/lib/use-theme";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { readText } from "@tauri-apps/plugin-clipboard-manager";
@@ -69,12 +71,24 @@ function highlightChunk(chunk: string, settings: TerminalKeywordSettings) {
 }
 
 export function TerminalView({ tabId, sessionId, onDisconnected, keywordSettings }: TerminalViewProps) {
+  const { themeId } = useTheme();
   const wrapperRef = useRef<HTMLDivElement | null>(null);
   const hostRef = useRef<HTMLDivElement | null>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const lastSizeRef = useRef<{ cols: number; rows: number } | null>(null);
   const activeSessionIdRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    const term = terminalRef.current;
+    if (!term) return;
+    const apply = () => {
+      term.options.theme = getTerminalTheme(themeId);
+    };
+    apply();
+    window.addEventListener("themechange", apply);
+    return () => window.removeEventListener("themechange", apply);
+  }, [themeId]);
 
   useEffect(() => {
     if (!hostRef.current) return;
@@ -95,29 +109,7 @@ export function TerminalView({ tabId, sessionId, onDisconnected, keywordSettings
       // Disable minimum contrast ratio enforcement so colors render exactly
       // as the application sends them (matches Terminus default behaviour).
       minimumContrastRatio: 1,
-      theme: {
-        background: "#050912",
-        foreground: "#e2e8f0",
-        cursor: "#38bdf8",
-        cursorAccent: "#050912",
-        selectionBackground: "#1e3a5f",
-        black: "#0b1120",
-        red: "#f87171",
-        green: "#34d399",
-        yellow: "#fbbf24",
-        blue: "#60a5fa",
-        magenta: "#c084fc",
-        cyan: "#22d3ee",
-        white: "#e2e8f0",
-        brightBlack: "#475569",
-        brightRed: "#fca5a5",
-        brightGreen: "#6ee7b7",
-        brightYellow: "#fcd34d",
-        brightBlue: "#93c5fd",
-        brightMagenta: "#d8b4fe",
-        brightCyan: "#67e8f9",
-        brightWhite: "#f8fafc",
-      },
+      theme: getTerminalTheme(themeId),
     });
     const fitAddon = new FitAddon();
     const webLinksAddon = new WebLinksAddon((_event, uri) => {
@@ -297,7 +289,7 @@ export function TerminalView({ tabId, sessionId, onDisconnected, keywordSettings
   return (
     <div
       ref={wrapperRef}
-      className="relative flex h-full w-full flex-1 bg-[#050912]"
+      className="app-surface relative flex h-full w-full flex-1"
     >
       <div ref={hostRef} className="h-full w-full px-3 py-2" />
     </div>

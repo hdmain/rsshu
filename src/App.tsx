@@ -39,6 +39,7 @@ import {
 import { SftpView, clearSftpSessionCache } from "@/components/sftp-view";
 import { TitleBar } from "@/components/title-bar";
 import { VaultOverlay } from "@/components/vault-overlay";
+import { ThemePicker } from "@/components/theme-picker";
 import {
   formatSftpBannerLabel,
   formatSessionTabLabel,
@@ -134,7 +135,7 @@ function reachabilityLabel(status: HostStatus | undefined): string | null {
 
 function statusColor(status: HostStatus) {
   if (status === "online") return "text-emerald-400";
-  if (status === "checking" || status === "connecting") return "text-amber-300";
+  if (status === "checking" || status === "connecting") return "text-amber-400";
   return "text-rose-400";
 }
 
@@ -168,13 +169,13 @@ type TopBarProps = {
 
 function TopBar({ screen, onChangeScreen, activeSessionCount, sftpConnected, onLock, right }: TopBarProps) {
   return (
-    <header className="relative z-20 flex h-14 shrink-0 items-center justify-between gap-4 border-b border-white/10 bg-gradient-to-r from-[#0a1120] via-[#0b1326] to-[#0a1120] px-4 backdrop-blur">
+    <header className="app-header relative z-20 flex h-14 shrink-0 items-center justify-between gap-4 px-4">
       <div className="flex min-w-0 items-center gap-3">
-        <div className="hidden items-center rounded-full border border-white/10 bg-white/5 p-1 text-xs md:flex">
+        <div className="hidden items-center rounded-full border app-chrome-border bg-muted/30 p-1 text-xs md:flex">
           <button
             onClick={() => onChangeScreen("hosts")}
             className={`flex items-center gap-1.5 rounded-full px-3 py-1 transition ${
-              screen === "hosts" ? "bg-sky-500/20 text-sky-200" : "text-slate-300 hover:text-white"
+              screen === "hosts" ? "app-nav-active" : "app-chrome-muted hover:app-chrome-text"
             }`}
           >
             <Server className="h-3.5 w-3.5" />
@@ -183,13 +184,13 @@ function TopBar({ screen, onChangeScreen, activeSessionCount, sftpConnected, onL
           <button
             onClick={() => onChangeScreen("terminal")}
             className={`flex items-center gap-1.5 rounded-full px-3 py-1 transition ${
-              screen === "terminal" ? "bg-sky-500/20 text-sky-200" : "text-slate-300 hover:text-white"
+              screen === "terminal" ? "app-nav-active" : "app-chrome-muted hover:app-chrome-text"
             }`}
           >
             <Terminal className="h-3.5 w-3.5" />
             Terminal
             {activeSessionCount > 0 ? (
-              <span className="ml-1 rounded-full bg-sky-500/30 px-1.5 text-[10px] font-medium text-sky-100">
+              <span className="ml-1 rounded-full app-accent-bg px-1.5 text-[10px] font-medium">
                 {activeSessionCount}
               </span>
             ) : null}
@@ -197,7 +198,7 @@ function TopBar({ screen, onChangeScreen, activeSessionCount, sftpConnected, onL
           <button
             onClick={() => onChangeScreen("sftp")}
             className={`flex items-center gap-1.5 rounded-full px-3 py-1 transition ${
-              screen === "sftp" ? "bg-sky-500/20 text-sky-200" : "text-slate-300 hover:text-white"
+              screen === "sftp" ? "app-nav-active" : "app-chrome-muted hover:app-chrome-text"
             }`}
           >
             <FolderOpen className="h-3.5 w-3.5" />
@@ -212,12 +213,12 @@ function TopBar({ screen, onChangeScreen, activeSessionCount, sftpConnected, onL
         {right}
         {onLock ? (
           <>
-            <div className="mx-1 h-6 w-px bg-white/10" />
+            <div className="mx-1 h-6 w-px app-chrome-border bg-[currentColor]" />
             <button
               type="button"
               onClick={onLock}
               title="Lock vault"
-              className="flex h-9 w-9 items-center justify-center rounded-md border border-white/10 bg-white/5 text-slate-300 transition hover:border-sky-400/40 hover:bg-sky-500/15 hover:text-sky-200"
+              className="app-chrome-muted flex h-9 w-9 items-center justify-center rounded-md border app-chrome-border bg-muted/30 transition hover:app-nav-active"
             >
               <Lock className="h-4 w-4" />
             </button>
@@ -232,9 +233,9 @@ type VaultUiState = "loading" | "new" | "locked" | "unlocked";
 
 function App() {
   function metricColor(percent: number): string {
-    if (percent > 90) return "text-rose-300";
-    if (percent > 75) return "text-amber-300";
-    return "text-slate-300";
+    if (percent > 90) return "text-destructive";
+    if (percent > 75) return "text-amber-400";
+    return "app-text-muted";
   }
 
   const [screen, setScreen] = useState<Screen>("hosts");
@@ -1156,15 +1157,14 @@ function App() {
     }
   }
 
-  const appShell =
-    "flex h-screen w-screen flex-col overflow-hidden bg-[radial-gradient(circle_at_top,_#0e1a33_0%,_#050912_55%,_#03060d_100%)] text-foreground";
+  const appShell = "app-shell flex h-screen w-screen flex-col overflow-hidden";
 
   if (vaultStatus !== "unlocked") {
     return (
       <div className={appShell}>
         <TitleBar />
         {vaultStatus === "loading" ? (
-          <div className="flex min-h-0 flex-1 items-center justify-center text-sm text-slate-400">
+          <div className="app-text-muted flex min-h-0 flex-1 items-center justify-center text-sm">
             Loading vault…
           </div>
         ) : (
@@ -1194,7 +1194,7 @@ function App() {
           right={
             <>
               <div className="relative hidden md:block">
-                <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
+                <Search className="app-icon-muted pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2" />
                 <Input
                   className="h-9 w-64 pl-7 text-xs"
                   value={search}
@@ -1223,8 +1223,8 @@ function App() {
         />
 
         <main className="grid flex-1 min-h-0 grid-cols-[240px_1fr] overflow-hidden">
-          <aside className="flex flex-col border-r border-white/10 bg-[#070c18]/80 p-3 backdrop-blur">
-            <p className="mb-2 px-2 text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-500">
+          <aside className="app-sidebar flex flex-col p-3">
+            <p className="app-text-muted mb-2 px-2 text-[10px] font-semibold uppercase tracking-[0.18em]">
               Navigation
             </p>
             <div className="space-y-1">
@@ -1233,12 +1233,12 @@ function App() {
                   key={item.key}
                   className={`flex w-full items-center gap-2 rounded-md px-3 py-2 text-sm transition ${
                     sidebarSection === item.key
-                      ? "bg-sky-500/15 text-sky-200 ring-1 ring-sky-500/20"
-                      : "text-slate-300 hover:bg-white/5 hover:text-white"
+                      ? "app-nav-active"
+                      : "app-chrome-muted app-chrome-hover hover:bg-muted/40"
                   }`}
                   onClick={() => setSidebarSection(item.key)}
                 >
-                  <span className={sidebarSection === item.key ? "text-sky-300" : "text-slate-400"}>
+                  <span className={sidebarSection === item.key ? "app-accent-text" : "app-chrome-muted"}>
                     {item.icon}
                   </span>
                   {item.label}
@@ -1246,15 +1246,15 @@ function App() {
               ))}
             </div>
             <Separator className="my-4 bg-white/10" />
-            <div className="px-2 text-[10px] uppercase tracking-[0.18em] text-slate-500">Summary</div>
-            <div className="mt-2 space-y-1.5 px-2 text-xs text-slate-300">
+            <div className="app-text-muted px-2 text-[10px] uppercase tracking-[0.18em]">Summary</div>
+            <div className="app-text-muted mt-2 space-y-1.5 px-2 text-xs">
               <div className="flex justify-between">
                 <span>Total hosts</span>
-                <span className="font-medium text-slate-100">{hosts.length}</span>
+                <span className="app-text-strong font-medium">{hosts.length}</span>
               </div>
               <div className="flex justify-between">
                 <span>Open sessions</span>
-                <span className="font-medium text-slate-100">{tabs.length}</span>
+                <span className="app-text-strong font-medium">{tabs.length}</span>
               </div>
             </div>
           </aside>
@@ -1276,13 +1276,13 @@ function App() {
                   </div>
 
                   {Object.keys(groupedHosts).length === 0 ? (
-                    <Card className="border-white/10 bg-white/[0.03]">
+                    <Card className="app-card">
                       <CardContent className="flex flex-col items-center justify-center gap-3 py-16 text-center">
-                        <div className="flex h-10 w-10 items-center justify-center rounded-full bg-sky-500/10 text-sky-300">
+                        <div className="app-accent-bg flex h-10 w-10 items-center justify-center rounded-full">
                           <Server className="h-5 w-5" />
                         </div>
-                        <p className="text-sm font-medium text-slate-100">No hosts yet</p>
-                        <p className="max-w-xs text-xs text-slate-400">
+                        <p className="app-text-strong text-sm font-medium">No hosts yet</p>
+                        <p className="app-text-muted max-w-xs text-xs">
                           Add your first SSH host to get started.
                         </p>
                         <Button size="sm" onClick={openNewHostModal}>
@@ -1296,27 +1296,27 @@ function App() {
                   {Object.entries(groupedHosts).map(([groupName, list]) => (
                     <div
                       key={groupName}
-                      className="overflow-hidden rounded-xl border border-white/10 bg-white/[0.03] shadow-[0_1px_0_0_rgba(255,255,255,0.03)_inset]"
+                      className="app-card overflow-hidden rounded-xl shadow-[0_1px_0_0_rgba(255,255,255,0.03)_inset]"
                     >
                       <button
-                        className="flex w-full items-center justify-between px-4 py-3 text-sm font-medium text-slate-200 hover:bg-white/[0.03]"
+                        className="app-text-strong app-soft-hover flex w-full items-center justify-between px-4 py-3 text-sm font-medium"
                         onClick={() => toggleGroup(groupName)}
                       >
                         <span className="flex items-center gap-2">
                           {collapsedGroups[groupName] ? (
-                            <ChevronRight className="h-4 w-4 text-slate-400" />
+                            <ChevronRight className="app-icon-muted h-4 w-4" />
                           ) : (
-                            <ChevronDown className="h-4 w-4 text-slate-400" />
+                            <ChevronDown className="app-icon-muted h-4 w-4" />
                           )}
-                          <Folder className="h-4 w-4 text-sky-300" />
+                          <Folder className="app-icon-accent h-4 w-4" />
                           {groupName}
                         </span>
-                        <Badge variant="outline" className="border-white/10 bg-white/5 text-slate-300">
+                        <Badge variant="outline" className="app-chrome-border app-soft app-text-muted">
                           {list.length}
                         </Badge>
                       </button>
                       {!collapsedGroups[groupName] ? (
-                        <div className="divide-y divide-white/5 border-t border-white/5">
+                        <div className="divide-y divide-border border-t border-border">
                           {list.map((host) => {
                             const hostStatus = hostConnectionStatus[host.id] ?? "offline";
                             const reachStatus = hostReachability[host.id];
@@ -1329,27 +1329,27 @@ function App() {
                             return (
                               <div
                                 key={host.id}
-                                className="group flex items-center justify-between px-4 py-3 transition hover:bg-white/[0.04]"
+                                className="group flex items-center justify-between px-4 py-3 transition app-soft-hover"
                               >
                                 <div className="flex min-w-0 items-center gap-3">
                                   <span className={`h-2 w-2 rounded-full ${statusDot(hostStatus)}`} />
                                   <div className="min-w-0">
-                                    <p className="truncate text-sm font-medium text-slate-100">
+                                    <p className="app-text-strong truncate text-sm font-medium">
                                       {hostCardTitle(host, privacyRedactHosts)}
                                     </p>
-                                    <p className="truncate text-xs text-slate-400">
+                                    <p className="app-text-muted truncate text-xs">
                                       {hostCardSubtitle(host, privacyRedactHosts)}
                                     </p>
                                     {passwordLabel ? (
                                       <div className="mt-0.5 flex items-center gap-1.5">
-                                        <KeyRound className="h-3 w-3 shrink-0 text-slate-500" />
-                                        <span className="truncate font-mono text-[11px] text-slate-500">
+                                        <KeyRound className="app-icon-muted h-3 w-3 shrink-0" />
+                                        <span className="app-text-muted truncate font-mono text-[11px]">
                                           {passwordLabel}
                                         </span>
                                         {!privacyRedactHosts && host.password ? (
                                           <button
                                             type="button"
-                                            className="shrink-0 rounded p-0.5 text-slate-500 hover:bg-white/10 hover:text-slate-300"
+                                            className="app-icon-muted app-soft-hover shrink-0 rounded p-0.5"
                                             title={
                                               revealedHostPasswords[host.id]
                                                 ? "Hide password"
@@ -1366,7 +1366,7 @@ function App() {
                                         ) : null}
                                       </div>
                                     ) : host.authMethod === "key" ? (
-                                      <p className="mt-0.5 text-[11px] text-slate-500">Private key</p>
+                                      <p className="app-text-muted mt-0.5 text-[11px]">Private key</p>
                                     ) : null}
                                   </div>
                                   {host.tags.length > 0 ? (
@@ -1375,7 +1375,7 @@ function App() {
                                         <Badge
                                           key={tag}
                                           variant="outline"
-                                          className="border-white/10 bg-white/5 text-[10px] text-slate-300"
+                                          className="app-chrome-border app-soft app-text-muted text-[10px]"
                                         >
                                           {tag}
                                         </Badge>
@@ -1387,7 +1387,7 @@ function App() {
                                   <span className={`hidden text-xs capitalize sm:inline ${statusColor(hostStatus)}`}>
                                     {hostStatusLabel(hostStatus)}
                                     {reachLabel ? (
-                                      <span className="normal-case text-slate-500"> · {reachLabel}</span>
+                                      <span className="app-text-muted normal-case"> · {reachLabel}</span>
                                     ) : null}
                                   </span>
                                   <Button size="sm" onClick={() => void connectHost(host)}>
@@ -1437,21 +1437,33 @@ function App() {
                 </>
               ) : sidebarSection === "settings" ? (
                 <div className="max-w-2xl space-y-4">
-                  <Card className="border-white/10 bg-[#1f2740]/80 shadow-xl">
+                  <Card className="app-panel border shadow-xl">
                     <CardHeader>
-                      <CardTitle className="text-slate-100">Quick navigation shortcut</CardTitle>
-                      <CardDescription className="text-slate-400">
+                      <CardTitle>Appearance</CardTitle>
+                      <CardDescription>
+                        Choose a color theme for the app shell, panels, and terminal.
+                      </CardDescription>
+                    </CardHeader>
+                    <CardContent>
+                      <ThemePicker />
+                    </CardContent>
+                  </Card>
+
+                  <Card className="app-panel border shadow-xl">
+                    <CardHeader>
+                      <CardTitle className="app-text-strong">Quick navigation shortcut</CardTitle>
+                      <CardDescription className="app-text-muted">
                         Press this key anywhere in the app to jump between Terminal and SFTP.
                         If no terminal tab is open, pressing it will switch to SFTP.
                       </CardDescription>
                     </CardHeader>
                     <CardContent>
                       <div className="flex items-center gap-3">
-                        <kbd className="inline-flex min-w-[2.5rem] items-center justify-center rounded border border-white/20 bg-white/[0.06] px-2.5 py-1 font-mono text-sm text-slate-100 shadow-sm">
+                        <kbd className="app-card app-text-strong inline-flex min-w-[2.5rem] items-center justify-center rounded px-2.5 py-1 font-mono text-sm shadow-sm">
                           {quickNavKey}
                         </kbd>
                         {capturingKey ? (
-                          <span className="animate-pulse text-sm text-amber-300">Press any key…</span>
+                          <span className="animate-pulse text-sm text-amber-400">Press any key…</span>
                         ) : (
                           <Button
                             size="sm"
@@ -1471,17 +1483,17 @@ function App() {
                           </Button>
                         ) : null}
                       </div>
-                      <p className="mt-2 text-xs text-slate-500">
+                      <p className="app-text-muted mt-2 text-xs">
                         On Terminal → switches to SFTP. On any other screen → switches to Terminal.
                         Supports keyboard keys, combos (e.g. Ctrl+F2) and extra mouse buttons (Mouse3 and above).
                       </p>
                     </CardContent>
                   </Card>
 
-                  <Card className="border-white/10 bg-[#1f2740]/80 shadow-xl">
+                  <Card className="app-panel border shadow-xl">
                     <CardHeader>
                       <div className="flex items-center justify-between">
-                        <CardTitle className="text-slate-100">Keyword highlighting</CardTitle>
+                        <CardTitle className="app-text-strong">Keyword highlighting</CardTitle>
                         <button
                           type="button"
                           aria-label="Toggle keyword highlighting"
@@ -1489,7 +1501,7 @@ function App() {
                             setTerminalKeywordSettings((prev) => ({ ...prev, enabled: !prev.enabled }))
                           }
                           className={`relative h-6 w-11 rounded-full transition ${
-                            terminalKeywordSettings.enabled ? "bg-emerald-500" : "bg-slate-600"
+                            terminalKeywordSettings.enabled ? "app-toggle-on" : "app-toggle-off"
                           }`}
                         >
                           <span
@@ -1510,7 +1522,7 @@ function App() {
                         ["network", "IP address & MAC"],
                       ].map(([key, label]) => (
                         <div key={key} className="flex items-center justify-between">
-                          <p className="text-sm font-medium text-slate-100">{label}</p>
+                          <p className="app-text-strong text-sm font-medium">{label}</p>
                           <input
                             type="color"
                             value={
@@ -1527,23 +1539,23 @@ function App() {
                                 },
                               }))
                             }
-                            className="h-8 w-14 cursor-pointer rounded-md border border-white/10 bg-transparent p-0"
+                            className="app-chrome-border h-8 w-14 cursor-pointer rounded-md border bg-transparent p-0"
                           />
                         </div>
                       ))}
                     </CardContent>
                   </Card>
 
-                  <Card className="border-white/10 bg-[#1f2740]/80 shadow-xl">
+                  <Card className="app-panel border shadow-xl">
                     <CardHeader>
                       <div className="flex items-center justify-between gap-3">
                         <div className="flex min-w-0 items-start gap-3">
-                          <div className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-white/5 text-slate-300">
+                          <div className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-muted/50 text-muted-foreground">
                             <EyeOff className="h-4 w-4" />
                           </div>
                           <div className="min-w-0">
-                            <CardTitle className="text-slate-100">Hide hosts and IPs in the UI</CardTitle>
-                            <CardDescription className="text-slate-400">
+                            <CardTitle className="app-text-strong">Hide hosts and IPs in the UI</CardTitle>
+                            <CardDescription className="app-text-muted">
                               Masks addresses and saved passwords on the host list, in terminal tabs, in the SSH
                               connect log, and on disconnected / SFTP headers. Vault data and the edit-host form
                               stay full unless you reveal them there.
@@ -1565,7 +1577,7 @@ function App() {
                             });
                           }}
                           className={`relative h-6 w-11 shrink-0 rounded-full transition ${
-                            privacyRedactHosts ? "bg-sky-500" : "bg-slate-600"
+                            privacyRedactHosts ? "app-toggle-on" : "app-toggle-off"
                           }`}
                         >
                           <span
@@ -1578,13 +1590,13 @@ function App() {
                     </CardHeader>
                     <CardContent>
                       <div className="space-y-3">
-                        <p className="text-sm text-slate-300">
+                        <p className="app-text-muted text-sm">
                           Does not change what is sent over SSH — only what is drawn on screen outside the host editor.
                         </p>
-                        <div className="flex items-center justify-between rounded-md border border-white/10 bg-white/[0.02] px-3 py-2">
+                        <div className="app-card app-soft flex items-center justify-between rounded-md px-3 py-2">
                           <div>
-                            <p className="text-sm font-medium text-slate-100">Terminal host info bar</p>
-                            <p className="text-xs text-slate-400">
+                            <p className="app-text-strong text-sm font-medium">Terminal host info bar</p>
+                            <p className="app-text-muted text-xs">
                               Shows host label + remote CPU and RAM usage at the bottom of terminal view.
                             </p>
                           </div>
@@ -1603,7 +1615,7 @@ function App() {
                               });
                             }}
                             className={`relative h-6 w-11 shrink-0 rounded-full transition ${
-                              showTerminalHostInfoBar ? "bg-sky-500" : "bg-slate-600"
+                              showTerminalHostInfoBar ? "app-toggle-on" : "app-toggle-off"
                             }`}
                           >
                             <span
@@ -1617,14 +1629,14 @@ function App() {
                     </CardContent>
                   </Card>
 
-                  <Card className="border-white/10 bg-[#1f2740]/80 shadow-xl">
+                  <Card className="app-panel border shadow-xl">
                     <CardHeader>
                       <div className="flex items-center justify-between gap-3">
                         <div className="min-w-0">
-                          <CardTitle className="text-slate-100">tcpraw addon</CardTitle>
-                          <CardDescription className="text-slate-400">
+                          <CardTitle className="app-text-strong">tcpraw addon</CardTitle>
+                          <CardDescription className="app-text-muted">
                             When a 6-digit code is copied to the clipboard, a quick-action button appears in the
-                            terminal status bar to run <span className="font-mono text-slate-300">tcpraw get &lt;code&gt;</span>.
+                            terminal status bar to run <span className="app-text-strong font-mono">tcpraw get &lt;code&gt;</span>.
                           </CardDescription>
                         </div>
                         <button
@@ -1643,7 +1655,7 @@ function App() {
                             });
                           }}
                           className={`relative h-6 w-11 shrink-0 rounded-full transition ${
-                            tcprawEnabled ? "bg-sky-500" : "bg-slate-600"
+                            tcprawEnabled ? "app-toggle-on" : "app-toggle-off"
                           }`}
                         >
                           <span
@@ -1656,12 +1668,12 @@ function App() {
                     </CardHeader>
                   </Card>
 
-                  <Card className="border-white/10 bg-[#1f2740]/80 shadow-xl">
+                  <Card className="app-panel border shadow-xl">
                     <CardHeader>
                       <div className="flex items-center justify-between">
                         <div>
-                          <CardTitle className="text-slate-100">SFTP</CardTitle>
-                          <CardDescription className="text-slate-400">File browser and open-file behaviour.</CardDescription>
+                          <CardTitle className="app-text-strong">SFTP</CardTitle>
+                          <CardDescription className="app-text-muted">File browser and open-file behaviour.</CardDescription>
                         </div>
                         <button
                           type="button"
@@ -1678,7 +1690,7 @@ function App() {
                             });
                           }}
                           className={`relative h-6 w-11 shrink-0 rounded-full transition ${
-                            sftpHideDotfiles ? "bg-sky-500" : "bg-slate-600"
+                            sftpHideDotfiles ? "app-toggle-on" : "app-toggle-off"
                           }`}
                         >
                           <span
@@ -1690,16 +1702,16 @@ function App() {
                       </div>
                     </CardHeader>
                     <CardContent className="space-y-4">
-                      <p className="text-sm text-slate-300">
+                      <p className="app-text-muted text-sm">
                         Hide file and folder names that start with <span className="font-mono">.</span> in the SFTP
                         view.
                       </p>
                       <div className="space-y-2">
-                        <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
+                        <p className="app-text-muted text-xs font-medium uppercase tracking-wide">
                           After you double-click a file (opens in an external app)
                         </p>
                         <div className="space-y-2">
-                          <label className="flex cursor-pointer items-start gap-2 rounded-md border border-white/5 bg-white/[0.02] p-2 text-sm text-slate-200 hover:bg-white/[0.04]">
+                          <label className="app-card app-soft app-soft-hover app-text-strong flex cursor-pointer items-start gap-2 rounded-md p-2 text-sm">
                             <input
                               type="radio"
                               className="mt-0.5"
@@ -1716,7 +1728,7 @@ function App() {
                             />
                             <span>Upload changes automatically (shortly after the file is saved on disk)</span>
                           </label>
-                          <label className="flex cursor-pointer items-start gap-2 rounded-md border border-white/5 bg-white/[0.02] p-2 text-sm text-slate-200 hover:bg-white/[0.04]">
+                          <label className="app-card app-soft app-soft-hover app-text-strong flex cursor-pointer items-start gap-2 rounded-md p-2 text-sm">
                             <input
                               type="radio"
                               className="mt-0.5"
@@ -1731,16 +1743,16 @@ function App() {
                                 }
                               }}
                             />
-                            <span>Require <strong className="font-medium text-slate-100">Save to server</strong> in the app to upload your edits</span>
+                            <span>Require <strong className="app-text-strong font-medium">Save to server</strong> in the app to upload your edits</span>
                           </label>
                         </div>
                       </div>
                     </CardContent>
                   </Card>
 
-                  <Card className="border-white/10 bg-[#1f2740]/80 shadow-xl">
+                  <Card className="app-panel border shadow-xl">
                     <CardHeader>
-                      <CardTitle className="text-slate-100">Cloud Sync (GitHub Gist)</CardTitle>
+                      <CardTitle className="app-text-strong">Cloud Sync (GitHub Gist)</CardTitle>
                       <CardDescription>
                         Auto-sync encrypted hosts data. Note format: random UUID + AES-256 encrypted payload.
                       </CardDescription>
@@ -1774,8 +1786,8 @@ function App() {
                         </Button>
                       </div>
                       {syncInfo ? <p className="text-xs text-emerald-300">{syncInfo}</p> : null}
-                      {syncError ? <p className="text-xs text-rose-300">{syncError}</p> : null}
-                      <p className="text-xs text-slate-400">
+                      {syncError ? <p className="text-xs text-destructive">{syncError}</p> : null}
+                      <p className="app-text-muted text-xs">
                         Once sync is on, any change to your hosts is automatically written to the Gist. On
                         another machine, use the same Gist ID and Sync key, then click Pull Now.
                       </p>
@@ -1783,8 +1795,8 @@ function App() {
                   </Card>
                 </div>
               ) : (
-                <Card className="border-white/10 bg-white/[0.03]">
-                  <CardContent className="py-10 text-sm text-slate-300">
+                <Card className="app-card">
+                  <CardContent className="app-text-muted py-10 text-sm">
                     {sidebarSection.charAt(0).toUpperCase() + sidebarSection.slice(1)} view coming soon.
                   </CardContent>
                 </Card>
@@ -1795,7 +1807,7 @@ function App() {
 
         {isHostModalOpen ? (
           <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm">
-            <Card className="w-full max-w-xl border-white/10 bg-[#0a1120]">
+            <Card className="app-modal w-full max-w-xl border">
               <CardHeader>
                 <CardTitle>{draft.id ? "Edit Host" : "Add Host"}</CardTitle>
                 <CardDescription>Create or update server connection.</CardDescription>
@@ -1828,7 +1840,7 @@ function App() {
                     />
                     <button
                       type="button"
-                      className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-1 text-slate-400 hover:bg-white/10 hover:text-slate-200"
+                      className="app-icon-muted app-soft-hover absolute right-2 top-1/2 -translate-y-1/2 rounded p-1"
                       title={showHostModalPassword ? "Hide password" : "Show password"}
                       onClick={() => setShowHostModalPassword((v) => !v)}
                     >
@@ -1883,23 +1895,23 @@ function App() {
         />
         <section className="relative flex min-h-0 flex-1 overflow-hidden">
           {sftpState === "empty" ? (
-            <div className="flex flex-1 items-center justify-center bg-[#050912]">
+            <div className="app-surface flex flex-1 items-center justify-center">
               <div className="flex flex-col items-center gap-4 text-center">
-                <div className="flex h-10 w-10 items-center justify-center rounded-full bg-white/5 text-slate-400">
+                <div className="flex h-10 w-10 items-center justify-center rounded-full bg-muted/50 text-muted-foreground">
                   <FolderOpen className="h-5 w-5" />
                 </div>
                 <div>
-                  <p className="text-sm text-slate-300">No SFTP session</p>
-                  <p className="text-xs text-slate-500">Browse files on a remote server.</p>
+                  <p className="app-text-strong text-sm">No SFTP session</p>
+                  <p className="app-text-muted text-xs">Browse files on a remote server.</p>
                 </div>
                 {topHosts.length > 0 ? (
                   <div className="w-full min-w-[260px] max-w-xs space-y-2">
-                    <p className="text-[10px] uppercase tracking-wider text-slate-500">Quick connect</p>
+                    <p className="app-text-muted text-[10px] uppercase tracking-wider">Quick connect</p>
                     {topHosts.map((host) => (
-                      <div key={host.id} className="flex items-center justify-between gap-2 rounded-md border border-white/10 bg-white/[0.04] px-3 py-2">
+                      <div key={host.id} className="app-card app-soft flex items-center justify-between gap-2 rounded-md px-3 py-2">
                         <div className="min-w-0 text-left">
-                          <p className="truncate text-xs font-medium text-slate-200">{host.name}</p>
-                          <p className="truncate text-[10px] text-slate-500">{host.username}@{host.host}:{host.port}</p>
+                          <p className="app-text-strong truncate text-xs font-medium">{host.name}</p>
+                          <p className="app-text-muted truncate text-[10px]">{host.username}@{host.host}:{host.port}</p>
                         </div>
                         <div className="flex shrink-0 gap-1.5">
                           <Button size="sm" variant="outline" className="h-7 px-2 text-[10px]" onClick={() => void openSftpForHost(host)}>
@@ -1921,13 +1933,13 @@ function App() {
             </div>
           ) : null}
           {sftpState === "connecting" ? (
-            <div className="flex flex-1 items-center justify-center bg-[#050912]">
-              <p className="text-sm text-amber-300">Connecting to SFTP…</p>
+            <div className="app-surface flex flex-1 items-center justify-center">
+              <p className="text-sm text-amber-400">Connecting to SFTP…</p>
             </div>
           ) : null}
           {sftpState === "error" ? (
-            <div className="flex flex-1 flex-col items-center justify-center gap-3 bg-[#050912] px-6 text-center">
-              <p className="max-w-xl text-sm text-rose-300">{sftpError}</p>
+            <div className="app-surface flex flex-1 flex-col items-center justify-center gap-3 px-6 text-center">
+              <p className="max-w-xl text-sm text-destructive">{sftpError}</p>
               <Button size="sm" variant="outline" onClick={() => setScreen("hosts")}>
                 Back to hosts
               </Button>
@@ -1982,7 +1994,7 @@ function App() {
       />
 
       {tabs.length > 0 ? (
-        <div className="flex h-9 shrink-0 items-center gap-1 overflow-x-auto border-b border-white/10 bg-[#070c18]/70 px-2">
+        <div className="app-sidebar flex h-9 shrink-0 items-center gap-1 overflow-x-auto border-b px-2">
           {tabs.map((tab) => {
             const isActive = tab.id === activeTabId;
             return (
@@ -1990,8 +2002,8 @@ function App() {
                 key={tab.id}
                 className={`group flex h-7 items-center gap-2 rounded-md border px-2.5 text-xs transition ${
                   isActive
-                    ? "border-sky-400/40 bg-sky-500/15 text-sky-100 shadow-[0_0_0_1px_rgba(56,189,248,0.15)]"
-                    : "border-white/5 bg-white/[0.03] text-slate-300 hover:bg-white/[0.06] hover:text-white"
+                    ? "app-nav-active shadow-[0_0_0_1px_rgb(var(--app-accent)/0.15)]"
+                    : "app-chrome-border border bg-muted/20 app-chrome-muted hover:bg-muted/40 hover:text-foreground"
                 }`}
               >
                 <button
@@ -2010,7 +2022,7 @@ function App() {
                       tab.disconnected || !tab.sessionId
                         ? "bg-amber-400/90 shadow-[0_0_6px_rgba(251,191,36,0.45)]"
                         : isActive
-                          ? "bg-sky-400 shadow-[0_0_6px_rgba(56,189,248,0.9)]"
+                          ? "bg-[rgb(var(--app-accent))] shadow-[0_0_6px_rgb(var(--app-accent)/0.9)]"
                           : "bg-emerald-400/80"
                     }`}
                   />
@@ -2023,7 +2035,7 @@ function App() {
                   </span>
                 </button>
                 <button
-                  className="rounded p-0.5 text-slate-400 opacity-60 hover:bg-white/10 hover:text-white hover:opacity-100"
+                  className="app-icon-muted app-soft-hover rounded p-0.5 opacity-60 hover:opacity-100"
                   onClick={() => void closeTab(tab.id)}
                   title="Close tab"
                 >
@@ -2037,23 +2049,23 @@ function App() {
 
       <section className="relative flex min-h-0 flex-1 overflow-hidden">
         {terminalState === "empty" ? (
-          <div className="flex flex-1 items-center justify-center bg-[#050912]">
+          <div className="app-surface flex flex-1 items-center justify-center">
             <div className="flex flex-col items-center gap-4 text-center">
-              <div className="flex h-10 w-10 items-center justify-center rounded-full bg-white/5 text-slate-400">
+              <div className="flex h-10 w-10 items-center justify-center rounded-full bg-muted/50 text-muted-foreground">
                 <Terminal className="h-5 w-5" />
               </div>
               <div>
-                <p className="text-sm text-slate-300">No active session</p>
-                <p className="text-xs text-slate-500">Pick a host to open a terminal.</p>
+                <p className="app-text-strong text-sm">No active session</p>
+                <p className="app-text-muted text-xs">Pick a host to open a terminal.</p>
               </div>
               {topHosts.length > 0 ? (
                 <div className="w-full min-w-[260px] max-w-xs space-y-2">
-                  <p className="text-[10px] uppercase tracking-wider text-slate-500">Quick connect</p>
+                  <p className="app-text-muted text-[10px] uppercase tracking-wider">Quick connect</p>
                   {topHosts.map((host) => (
-                    <div key={host.id} className="flex items-center justify-between gap-2 rounded-md border border-white/10 bg-white/[0.04] px-3 py-2">
+                    <div key={host.id} className="app-card app-soft flex items-center justify-between gap-2 rounded-md px-3 py-2">
                       <div className="min-w-0 text-left">
-                        <p className="truncate text-xs font-medium text-slate-200">{host.name}</p>
-                        <p className="truncate text-[10px] text-slate-500">{host.username}@{host.host}:{host.port}</p>
+                        <p className="app-text-strong truncate text-xs font-medium">{host.name}</p>
+                        <p className="app-text-muted truncate text-[10px]">{host.username}@{host.host}:{host.port}</p>
                       </div>
                       <div className="flex shrink-0 gap-1.5">
                         <Button size="sm" variant="outline" className="h-7 px-2 text-[10px]" onClick={() => void openSftpForHost(host)}>
@@ -2075,37 +2087,37 @@ function App() {
           </div>
         ) : null}
         {terminalState === "connecting" ? (
-          <div className="flex flex-1 flex-col items-center justify-center bg-[#050912] px-6 py-8">
-            <div className="w-full max-w-lg rounded-lg border border-sky-500/20 bg-black/40 px-4 py-3 font-mono text-[13px] leading-relaxed shadow-[0_0_40px_rgba(14,165,233,0.08)]">
-              <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-sky-300/90">
+          <div className="app-surface flex flex-1 flex-col items-center justify-center px-6 py-8">
+            <div className="app-card bg-black/40 w-full max-w-lg rounded-lg px-4 py-3 font-mono text-[13px] leading-relaxed shadow-[0_0_40px_rgba(14,165,233,0.08)]">
+              <p className="app-icon-accent mb-2 text-[11px] font-semibold uppercase tracking-wider">
                 SSH connection
               </p>
-              <div className="max-h-[min(50vh,320px)] space-y-1 overflow-y-auto text-slate-300">
+              <div className="app-text-muted max-h-[min(50vh,320px)] space-y-1 overflow-y-auto">
                 {sshProgressLines.length === 0 ? (
-                  <p className="animate-pulse text-slate-500">Waiting for host…</p>
+                  <p className="app-text-muted animate-pulse">Waiting for host…</p>
                 ) : (
                   sshProgressLines.map((line, i) => (
                     <p
                       key={`${i}-${line.slice(0, 24)}`}
                       className={`border-l-2 border-transparent pl-2 transition-all duration-300 ${
                         i === sshProgressLines.length - 1
-                          ? "border-sky-400/70 text-sky-100"
-                          : "text-slate-400"
+                          ? "border-[rgb(var(--app-accent)/0.7)] app-text-strong"
+                          : "app-text-muted"
                       }`}
                     >
-                      <span className="select-none text-slate-600">{">"} </span>
+                      <span className="app-text-muted select-none">{">"} </span>
                       {redactConnectionLogLine(line, hosts, privacyRedactHosts)}
                     </p>
                   ))
                 )}
               </div>
             </div>
-            <p className="mt-4 text-xs text-slate-500">Stages mirror the Rust SSH client (TCP → KEX → auth → shell).</p>
+            <p className="app-text-muted mt-4 text-xs">Stages mirror the Rust SSH client (TCP → KEX → auth → shell).</p>
           </div>
         ) : null}
         {terminalState === "error" ? (
-          <div className="flex flex-1 flex-col items-center justify-center gap-3 bg-[#050912] px-6 text-center">
-            <p className="max-w-xl text-sm text-rose-300">{terminalError}</p>
+          <div className="app-surface flex flex-1 flex-col items-center justify-center gap-3 px-6 text-center">
+            <p className="max-w-xl text-sm text-destructive">{terminalError}</p>
             <Button size="sm" variant="outline" onClick={() => setScreen("hosts")}>
               <Server className="mr-1.5 h-3.5 w-3.5" />
               Hosts
@@ -2113,21 +2125,21 @@ function App() {
           </div>
         ) : null}
         {terminalState === "disconnected" && activeTab?.disconnected ? (
-          <div className="flex flex-1 flex-col items-center justify-center gap-5 bg-[#050912] px-6">
-            <div className="flex h-14 w-14 items-center justify-center rounded-2xl border border-amber-500/25 bg-amber-500/10 text-amber-200">
+          <div className="app-surface flex flex-1 flex-col items-center justify-center gap-5 px-6">
+            <div className="flex h-14 w-14 items-center justify-center rounded-2xl border border-amber-500/30 bg-amber-500/10 text-amber-400">
               <Unplug className="h-7 w-7" />
             </div>
             <div className="max-w-md text-center">
-              <p className="text-lg font-medium tracking-tight text-slate-100">Disconnected</p>
+              <p className="app-text-strong text-lg font-medium tracking-tight">Disconnected</p>
               {activeTab.disconnectReason ? (
-                <p className="mt-2 text-sm text-slate-400">{activeTab.disconnectReason}</p>
+                <p className="app-text-muted mt-2 text-sm">{activeTab.disconnectReason}</p>
               ) : null}
               {reconnectError ? (
-                <p className="mt-3 rounded-md border border-rose-500/30 bg-rose-950/40 px-3 py-2 text-left text-xs text-rose-200">
+                <p className="mt-3 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-left text-xs text-destructive">
                   {reconnectError}
                 </p>
               ) : null}
-              <p className="mt-2 text-xs text-slate-500">
+              <p className="app-text-muted mt-2 text-xs">
                 {formatSessionTabLabel(
                   hosts.find((h) => h.id === activeTab.hostId),
                   activeTab.hostLabel,
@@ -2156,8 +2168,8 @@ function App() {
               />
             </div>
             {showTerminalHostInfoBar ? (
-              <div className="flex h-8 shrink-0 items-center justify-between gap-3 border-t border-white/10 bg-[#070c18]/95 px-3 text-[11px] text-slate-300">
-                <span className="truncate text-slate-400">
+              <div className="app-sidebar flex h-8 shrink-0 items-center justify-between gap-3 border-t px-3 text-[11px] app-chrome-muted">
+                <span className="app-text-muted truncate">
                   {activeTabHost
                     ? formatSessionTabLabel(activeTabHost, activeTab.hostLabel, privacyRedactHosts)
                     : "Host details unavailable"}
@@ -2167,7 +2179,7 @@ function App() {
                     <button
                       type="button"
                       title={`Run: tcpraw get ${tcprawCode}`}
-                      className="flex items-center gap-1.5 rounded border border-sky-500/40 bg-sky-500/15 px-2 py-0.5 text-[10px] font-medium text-sky-200 transition hover:bg-sky-500/30 active:scale-95"
+                      className="app-banner-info flex items-center gap-1.5 rounded border px-2 py-0.5 text-[10px] font-medium transition active:scale-95"
                       onClick={() => {
                         if (!activeTab.sessionId) return;
                         void invoke("ssh_send_input", {
@@ -2180,10 +2192,10 @@ function App() {
                     </button>
                   ) : null}
                   {hostMetricsLoading && !hostMetrics && !hostMetricsError ? (
-                    <span className="text-slate-500">Fetching host metrics…</span>
+                    <span className="app-text-muted">Fetching host metrics…</span>
                   ) : null}
                   {!hostMetricsLoading && hostMetricsError ? (
-                    <span className="max-w-[480px] truncate text-amber-300">
+                    <span className="max-w-[480px] truncate text-amber-400">
                       CPU/RAM unavailable: {hostMetricsError}
                     </span>
                   ) : null}
@@ -2192,7 +2204,7 @@ function App() {
                       <span className={`truncate ${metricColor(hostMetrics.cpu_usage_percent)}`}>
                         CPU {hostMetrics.cpu_usage_percent.toFixed(1)}%
                       </span>
-                      <span className="max-w-[320px] truncate text-slate-400">{hostMetrics.cpu_model}</span>
+                      <span className="app-text-muted max-w-[320px] truncate">{hostMetrics.cpu_model}</span>
                       {hostMetrics.ram_total_mb > 0 ? (
                         <span
                           className={`truncate ${metricColor(
@@ -2203,14 +2215,14 @@ function App() {
                           {(hostMetrics.ram_total_mb / 1024).toFixed(2)} GB
                         </span>
                       ) : (
-                        <span className="truncate text-slate-500">RAM n/a</span>
+                        <span className="app-text-muted truncate">RAM n/a</span>
                       )}
-                      <span className="truncate text-slate-300">
+                      <span className="app-text-muted truncate">
                         Down {hostMetrics.download_kbps >= 1024
                           ? `${(hostMetrics.download_kbps / 1024).toFixed(2)} MB/s`
                           : `${hostMetrics.download_kbps.toFixed(1)} KB/s`}
                       </span>
-                      <span className="truncate text-slate-300">
+                      <span className="app-text-muted truncate">
                         Up {hostMetrics.upload_kbps >= 1024
                           ? `${(hostMetrics.upload_kbps / 1024).toFixed(2)} MB/s`
                           : `${hostMetrics.upload_kbps.toFixed(1)} KB/s`}

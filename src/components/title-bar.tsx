@@ -68,11 +68,11 @@ export function TitleBar({ title = "RSSHU" }: TitleBarProps) {
   return (
     <div
       data-tauri-drag-region
-      className="flex h-8 shrink-0 select-none items-center justify-between border-b border-white/10 bg-[#070c18]/90 pl-3 text-[12px] text-slate-300 backdrop-blur"
+      className="app-title-bar flex h-8 shrink-0 select-none items-center justify-between pl-3 text-[12px]"
     >
       <div data-tauri-drag-region className="flex min-w-0 flex-1 items-center gap-2">
-        <Terminal className="h-3.5 w-3.5 shrink-0 text-sky-400" />
-        <span data-tauri-drag-region className="truncate font-medium tracking-wide text-slate-200">
+        <Terminal className="app-accent-text h-3.5 w-3.5 shrink-0" />
+        <span data-tauri-drag-region className="truncate font-medium tracking-wide app-chrome-text">
           {title}
         </span>
       </div>
@@ -80,7 +80,7 @@ export function TitleBar({ title = "RSSHU" }: TitleBarProps) {
         <button
           type="button"
           aria-label="Minimize"
-          className="flex h-full w-11 items-center justify-center text-slate-400 transition hover:bg-white/10 hover:text-white"
+          className="app-chrome-muted flex h-full w-11 items-center justify-center transition app-chrome-hover"
           onClick={onMinimize}
         >
           <Minus className="h-3.5 w-3.5" />
@@ -88,7 +88,7 @@ export function TitleBar({ title = "RSSHU" }: TitleBarProps) {
         <button
           type="button"
           aria-label={maximized ? "Restore" : "Maximize"}
-          className="flex h-full w-11 items-center justify-center text-slate-400 transition hover:bg-white/10 hover:text-white"
+          className="app-chrome-muted flex h-full w-11 items-center justify-center transition app-chrome-hover"
           onClick={onToggleMaximize}
         >
           {maximized ? (
@@ -100,7 +100,7 @@ export function TitleBar({ title = "RSSHU" }: TitleBarProps) {
         <button
           type="button"
           aria-label="Close"
-          className="flex h-full w-11 items-center justify-center text-slate-400 transition hover:bg-rose-500/80 hover:text-white"
+          className="app-chrome-muted flex h-full w-11 items-center justify-center transition hover:bg-rose-500/80 hover:text-white"
           onClick={onClose}
         >
           <X className="h-3.5 w-3.5" />
