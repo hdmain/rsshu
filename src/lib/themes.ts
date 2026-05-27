@@ -59,6 +59,22 @@ function makeBuiltin(
   extraCss: Record<string, string> = {},
 ): ThemeDefinition {
   const mode = id === "light" ? "light" : "dark";
+  const cardBgTop =
+    mode === "light"
+      ? mixHex(surface, "#ffffff", 0.78)
+      : mixHex(surface, "#ffffff", 0.14);
+  const cardBgBottom =
+    mode === "light"
+      ? mixHex(surface, "#e2e8f0", 0.55)
+      : mixHex(surface, "#000000", 0.18);
+  const cardBorder =
+    mode === "light"
+      ? mixHex(surface, "#334155", 0.22)
+      : mixHex(surface, "#ffffff", 0.2);
+  const cardShadow =
+    mode === "light"
+      ? "0 1px 0 0 rgb(255 255 255 / 0.85) inset, 0 12px 24px -18px rgb(15 23 42 / 0.32)"
+      : "0 1px 0 0 rgb(255 255 255 / 0.05) inset, 0 10px 26px -16px rgb(2 6 23 / 0.78)";
   return {
     id,
     label,
@@ -67,6 +83,9 @@ function makeBuiltin(
     cssVars: {
       ...buildAppCssVars(surface, accent, mode),
       "--app-panel": panelRgba(surface, mode === "light" ? 0.95 : 0.82),
+      "--app-card-bg": `linear-gradient(180deg, ${cardBgTop}, ${cardBgBottom})`,
+      "--app-card-border": cardBorder,
+      "--app-card-shadow": cardShadow,
       ...extraCss,
     },
     terminal,
@@ -113,6 +132,9 @@ export const BUILTIN_THEMES: Record<BuiltinThemeId, ThemeDefinition> = {
       "--app-accent-soft": "rgb(14 165 233 / 0.16)",
       "--app-chrome-fg": "203 213 225",
       "--app-chrome-border": "255 255 255 / 0.1",
+      "--app-card-bg": "linear-gradient(180deg, rgb(17 25 44 / 0.92), rgb(12 19 34 / 0.92))",
+      "--app-card-border": "rgb(148 163 184 / 0.22)",
+      "--app-card-shadow": "0 1px 0 0 rgb(255 255 255 / 0.05) inset, 0 8px 24px -16px rgb(2 6 23 / 0.75)",
     },
   ),
   dark: makeBuiltin(

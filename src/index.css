@@ -93,7 +93,10 @@
   }
 
   .app-card {
-    @apply border app-chrome-border bg-card/40;
+    @apply border;
+    border-color: var(--app-card-border, rgb(var(--app-chrome-border)));
+    background: var(--app-card-bg, hsl(var(--card) / 0.55));
+    box-shadow: var(--app-card-shadow, none);
   }
 
   .app-soft {
