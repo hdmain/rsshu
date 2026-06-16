@@ -506,7 +506,7 @@ total1=\$((user+nice+system+idle+iowait+irq+softirq+steal));
 idle1=\$((idle+iowait));
 rx1=\$(awk -F'[: ]+' 'NR>2 && \$1 !~ /^lo$/ {rx+=\$3} END {print rx+0}' /proc/net/dev 2>/dev/null);
 tx1=\$(awk -F'[: ]+' 'NR>2 && \$1 !~ /^lo$/ {tx+=\$11} END {print tx+0}' /proc/net/dev 2>/dev/null);
-sleep 1;
+sleep 0.5;
 read cpu user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat;
 total2=\$((user+nice+system+idle+iowait+irq+softirq+steal));
 idle2=\$((idle+iowait));

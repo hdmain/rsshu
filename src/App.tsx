@@ -253,6 +253,7 @@ function App() {
   const [draft, setDraft] = useState<HostDraft>(emptyDraft);
   const [tabs, setTabs] = useState<SessionTab[]>([]);
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
+  const activeTabIdRef = useRef<string | null>(null);
   const [terminalState, setTerminalState] = useState<TerminalState>("empty");
   const [terminalError, setTerminalError] = useState("");
   const [sshProgressLines, setSshProgressLines] = useState<string[]>([]);
@@ -292,6 +293,8 @@ function App() {
   const TCPRAW_ENABLED_KEY = "rsshu.settings.tcprawEnabled";
   const QUICK_NAV_KEY_STORAGE = "rsshu.settings.quickNavKey";
   const CONNECT_COUNTS_KEY = "rsshu.connectCounts";
+  /** Remote metrics script sleeps 0.5s for CPU/network delta; poll slightly above that. */
+  const HOST_METRICS_POLL_MS = 2000;
   const [sftpHideDotfiles, setSftpHideDotfiles] = useState(false);
   const [sftpOpenEditMode, setSftpOpenEditMode] = useState<"auto" | "confirm">("auto");
   const [privacyRedactHosts, setPrivacyRedactHosts] = useState(false);
@@ -312,6 +315,12 @@ function App() {
   const [hostMetrics, setHostMetrics] = useState<SshHostMetricsResponse | null>(null);
   const [hostMetricsLoading, setHostMetricsLoading] = useState(false);
   const [hostMetricsError, setHostMetricsError] = useState("");
+  const hostMetricsInFlightRef = useRef(false);
+  const hostMetricsFirstLoadRef = useRef(true);
+
+  useEffect(() => {
+    activeTabIdRef.current = activeTabId;
+  }, [activeTabId]);
 
   useEffect(() => {
     try {
@@ -714,28 +723,35 @@ function App() {
       return;
     }
 
+    hostMetricsFirstLoadRef.current = true;
     let cancelled = false;
     const fetchMetrics = async () => {
+      if (hostMetricsInFlightRef.current) return;
+      hostMetricsInFlightRef.current = true;
+      const showLoading = hostMetricsFirstLoadRef.current;
       try {
-        setHostMetricsLoading(true);
+        if (showLoading) setHostMetricsLoading(true);
         setHostMetricsError("");
         const metrics = await invoke<SshHostMetricsResponse>("ssh_fetch_host_metrics", {
           sessionId: activeTab.sessionId,
         });
         if (cancelled) return;
         setHostMetrics(metrics);
+        hostMetricsFirstLoadRef.current = false;
       } catch (error) {
         if (cancelled) return;
         setHostMetricsError(String(error));
       } finally {
-        if (!cancelled) setHostMetricsLoading(false);
+        hostMetricsInFlightRef.current = false;
+        if (!cancelled && showLoading) setHostMetricsLoading(false);
       }
     };
 
     void fetchMetrics();
-    const timer = window.setInterval(() => void fetchMetrics(), 15000);
+    const timer = window.setInterval(() => void fetchMetrics(), HOST_METRICS_POLL_MS);
     return () => {
       cancelled = true;
+      hostMetricsInFlightRef.current = false;
       window.clearInterval(timer);
     };
   }, [showTerminalHostInfoBar, screen, terminalState, activeTab?.sessionId]);
@@ -992,14 +1008,49 @@ function App() {
     [tabs, activeTabId]
   );
 
+  function sessionTabLabel(host: Host): string {
+    return `${host.name} (${host.username}@${host.host})`;
+  }
+
   async function startShellForHost(host: Host, existingTabId: string | null) {
     let unlisten: (() => void) | undefined;
+    const label = sessionTabLabel(host);
+    let targetTabId = existingTabId;
     setSshProgressLines([]);
     setReconnectError("");
     setTerminalState("connecting");
     setTerminalError("");
     setHostConnecting(host.id, true);
     setIsLoading(true);
+    if (targetTabId) {
+      setTabs((prev) =>
+        prev.map((t) =>
+          t.id === targetTabId
+            ? {
+                ...t,
+                hostId: host.id,
+                hostLabel: label,
+                disconnected: false,
+                disconnectReason: undefined,
+              }
+            : t
+        )
+      );
+      setActiveTabId(targetTabId);
+      activeTabIdRef.current = targetTabId;
+    } else {
+      const tab: SessionTab = {
+        id: crypto.randomUUID(),
+        hostId: host.id,
+        hostLabel: label,
+        sessionId: null,
+        disconnected: false,
+      };
+      targetTabId = tab.id;
+      setTabs((prev) => [tab, ...prev]);
+      setActiveTabId(tab.id);
+      activeTabIdRef.current = tab.id;
+    }
     try {
       unlisten = await listen<SshProgressPayload>("ssh-connection-progress", (event) => {
         const p = event.payload as SshProgressPayload | undefined;
@@ -1017,11 +1068,10 @@ function App() {
           passphrase: host.passphrase,
         },
       });
-      const label = `${host.name} (${host.username}@${host.host})`;
-      if (existingTabId) {
+      if (targetTabId) {
         setTabs((prev) =>
           prev.map((t) =>
-            t.id === existingTabId
+            t.id === targetTabId
               ? {
                   ...t,
                   hostId: host.id,
@@ -1033,24 +1083,29 @@ function App() {
               : t
           )
         );
-        setActiveTabId(existingTabId);
-      } else {
-        const tab: SessionTab = {
-          id: crypto.randomUUID(),
-          hostId: host.id,
-          hostLabel: label,
-          sessionId: response.session_id,
-          disconnected: false,
-        };
-        setTabs((prev) => [tab, ...prev]);
-        setActiveTabId(tab.id);
       }
-      setTerminalState("connected");
+      if (activeTabIdRef.current === targetTabId) {
+        setTerminalState("connected");
+      }
     } catch (error) {
       const msg = String(error);
-      if (existingTabId) {
-        setReconnectError(msg);
-        setTerminalState("disconnected");
+      if (targetTabId) {
+        setTabs((prev) =>
+          prev.map((t) =>
+            t.id === targetTabId
+              ? {
+                  ...t,
+                  sessionId: null,
+                  disconnected: true,
+                  disconnectReason: "SSH connection failed before the shell opened.",
+                }
+              : t
+          )
+        );
+        if (activeTabIdRef.current === targetTabId) {
+          setReconnectError(msg);
+          setTerminalState("disconnected");
+        }
       } else {
         setTerminalState("error");
         setTerminalError(msg);
@@ -1147,6 +1202,7 @@ function App() {
     const nextActive = nextActiveId ? nextTabs.find((t) => t.id === nextActiveId) ?? null : null;
     setTabs(nextTabs);
     setActiveTabId(nextActiveId);
+    activeTabIdRef.current = nextActiveId;
     if (nextTabs.length === 0) {
       setTerminalState("empty");
       setScreen("hosts");
@@ -2000,17 +2056,20 @@ function App() {
             return (
               <div
                 key={tab.id}
-                className={`group flex h-7 items-center gap-2 rounded-md border px-2.5 text-xs transition ${
+                className={`group flex h-7 min-w-24 max-w-[220px] items-center gap-2 rounded-md border px-2.5 text-xs transition ${
                   isActive
                     ? "app-nav-active shadow-[0_0_0_1px_rgb(var(--app-accent)/0.15)]"
                     : "app-chrome-border border bg-muted/20 app-chrome-muted hover:bg-muted/40 hover:text-foreground"
                 }`}
               >
                 <button
-                  className="flex items-center gap-2"
+                  className="flex min-w-0 flex-1 items-center gap-2"
                   onClick={() => {
                     setActiveTabId(tab.id);
-                    if (tab.disconnected || !tab.sessionId) {
+                    activeTabIdRef.current = tab.id;
+                    if (!tab.sessionId && !tab.disconnected) {
+                      setTerminalState("connecting");
+                    } else if (tab.disconnected || !tab.sessionId) {
                       setTerminalState("disconnected");
                     } else {
                       setTerminalState("connected");
@@ -2026,7 +2085,7 @@ function App() {
                           : "bg-emerald-400/80"
                     }`}
                   />
-                  <span className="max-w-[220px] truncate">
+                  <span className="min-w-0 flex-1 truncate text-left">
                     {formatSessionTabLabel(
                       hosts.find((h) => h.id === tab.hostId),
                       tab.hostLabel,
