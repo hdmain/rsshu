@@ -91,6 +91,21 @@ type SftpSessionInfo = { sessionId: string; home: string; hostLabel: string; hos
 type SyncStatusResponse = { enabled: boolean; gist_id: string | null };
 type SyncEnableResponse = { gist_id: string; sync_key: string };
 type SyncPollResponse = { has_update: boolean; payload: string | null };
+type UpdateCheckResponse = {
+  current_version: string;
+  latest_version: string | null;
+  update_available: boolean;
+  available_for_os: boolean;
+  os: string;
+  arch: string;
+  release_url: string | null;
+  asset_name: string | null;
+  message: string;
+};
+type UpdateInstallResponse = {
+  installer_path: string;
+  message: string;
+};
 
 type HostDraft = {
   id: string | null;
@@ -291,6 +306,7 @@ function App() {
   const PRIVACY_REDACT_HOSTS_KEY = "rsshu.settings.privacyRedactHosts";
   const TERMINAL_HOST_INFO_BAR_KEY = "rsshu.settings.terminalHostInfoBar";
   const TCPRAW_ENABLED_KEY = "rsshu.settings.tcprawEnabled";
+  const AUTO_INSTALL_UPDATES_KEY = "rsshu.settings.autoInstallUpdates";
   const QUICK_NAV_KEY_STORAGE = "rsshu.settings.quickNavKey";
   const CONNECT_COUNTS_KEY = "rsshu.connectCounts";
   /** Remote metrics script sleeps 0.5s for CPU/network delta; poll slightly above that. */
@@ -301,6 +317,11 @@ function App() {
   const [showTerminalHostInfoBar, setShowTerminalHostInfoBar] = useState(true);
   const [tcprawEnabled, setTcprawEnabled] = useState(false);
   const [tcprawCode, setTcprawCode] = useState<string | null>(null);
+  const [autoInstallUpdates, setAutoInstallUpdates] = useState(false);
+  const [updateCheck, setUpdateCheck] = useState<UpdateCheckResponse | null>(null);
+  const [updateBusy, setUpdateBusy] = useState(false);
+  const [updateError, setUpdateError] = useState("");
+  const [updateInfo, setUpdateInfo] = useState("");
   const [quickNavKey, setQuickNavKey] = useState("F2");
   const [capturingKey, setCapturingKey] = useState(false);
   const [connectCounts, setConnectCounts] = useState<Record<string, { ssh: number; sftp: number }>>(
@@ -317,6 +338,7 @@ function App() {
   const [hostMetricsError, setHostMetricsError] = useState("");
   const hostMetricsInFlightRef = useRef(false);
   const hostMetricsFirstLoadRef = useRef(true);
+  const autoUpdateCheckedRef = useRef(false);
 
   useEffect(() => {
     activeTabIdRef.current = activeTabId;
@@ -366,6 +388,21 @@ function App() {
       // ignore
     }
   }, []);
+
+  useEffect(() => {
+    try {
+      const v = localStorage.getItem(AUTO_INSTALL_UPDATES_KEY);
+      if (v === "1" || v === "true") setAutoInstallUpdates(true);
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!autoInstallUpdates || autoUpdateCheckedRef.current) return;
+    autoUpdateCheckedRef.current = true;
+    void checkForUpdates(true);
+  }, [autoInstallUpdates]);
 
   useEffect(() => {
     try {
@@ -612,6 +649,39 @@ function App() {
       setSyncError(String(err));
     } finally {
       setSyncBusy(false);
+    }
+  }
+
+  async function installLatestUpdate() {
+    setUpdateBusy(true);
+    setUpdateError("");
+    setUpdateInfo("Downloading installer…");
+    try {
+      const res = await invoke<UpdateInstallResponse>("app_install_update");
+      setUpdateInfo(res.message);
+    } catch (err) {
+      setUpdateError(String(err));
+      setUpdateInfo("");
+    } finally {
+      setUpdateBusy(false);
+    }
+  }
+
+  async function checkForUpdates(installWhenAvailable = false) {
+    setUpdateBusy(true);
+    setUpdateError("");
+    setUpdateInfo("");
+    try {
+      const res = await invoke<UpdateCheckResponse>("app_check_update");
+      setUpdateCheck(res);
+      setUpdateInfo(res.message);
+      if (installWhenAvailable && res.update_available) {
+        await installLatestUpdate();
+      }
+    } catch (err) {
+      setUpdateError(String(err));
+    } finally {
+      setUpdateBusy(false);
     }
   }
 
@@ -1502,6 +1572,94 @@ function App() {
                     </CardHeader>
                     <CardContent>
                       <ThemePicker />
+                    </CardContent>
+                  </Card>
+
+                  <Card className="app-panel border shadow-xl">
+                    <CardHeader>
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="min-w-0">
+                          <CardTitle className="app-text-strong">App updates</CardTitle>
+                          <CardDescription className="app-text-muted">
+                            Checks GitHub Releases and only installs assets matching this OS and CPU architecture.
+                          </CardDescription>
+                        </div>
+                        <button
+                          type="button"
+                          aria-label="Auto-install matching app updates"
+                          onClick={() => {
+                            setAutoInstallUpdates((v) => {
+                              const next = !v;
+                              try {
+                                localStorage.setItem(AUTO_INSTALL_UPDATES_KEY, next ? "1" : "0");
+                              } catch {
+                                // ignore
+                              }
+                              return next;
+                            });
+                          }}
+                          className={`relative h-6 w-11 shrink-0 rounded-full transition ${
+                            autoInstallUpdates ? "app-toggle-on" : "app-toggle-off"
+                          }`}
+                        >
+                          <span
+                            className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition ${
+                              autoInstallUpdates ? "left-[22px]" : "left-0.5"
+                            }`}
+                          />
+                        </button>
+                      </div>
+                    </CardHeader>
+                    <CardContent className="space-y-3">
+                      <div className="grid gap-2 text-xs sm:grid-cols-2">
+                        <div className="app-card app-soft rounded-md px-3 py-2">
+                          <p className="app-text-muted">Current version</p>
+                          <p className="app-text-strong font-mono">
+                            {updateCheck?.current_version ?? "not checked"}
+                          </p>
+                        </div>
+                        <div className="app-card app-soft rounded-md px-3 py-2">
+                          <p className="app-text-muted">Platform checked</p>
+                          <p className="app-text-strong font-mono">
+                            {updateCheck ? `${updateCheck.os}-${updateCheck.arch}` : "not checked"}
+                          </p>
+                        </div>
+                        <div className="app-card app-soft rounded-md px-3 py-2">
+                          <p className="app-text-muted">Latest version</p>
+                          <p className="app-text-strong font-mono">
+                            {updateCheck?.latest_version ?? "not checked"}
+                          </p>
+                        </div>
+                        <div className="app-card app-soft rounded-md px-3 py-2">
+                          <p className="app-text-muted">Installer asset</p>
+                          <p className="app-text-strong truncate font-mono">
+                            {updateCheck?.asset_name ?? "none selected"}
+                          </p>
+                        </div>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={updateBusy}
+                          onClick={() => void checkForUpdates(autoInstallUpdates)}
+                        >
+                          <RefreshCw className={`mr-1.5 h-3.5 w-3.5 ${updateBusy ? "animate-spin" : ""}`} />
+                          Check updates
+                        </Button>
+                        <Button
+                          size="sm"
+                          disabled={updateBusy || !updateCheck?.update_available}
+                          onClick={() => void installLatestUpdate()}
+                        >
+                          Download & install
+                        </Button>
+                        <span className="app-text-muted text-xs">
+                          Auto-install {autoInstallUpdates ? "enabled" : "disabled"}
+                        </span>
+                      </div>
+                      {updateInfo ? <p className="text-xs text-emerald-400">{updateInfo}</p> : null}
+                      {updateError ? <p className="text-xs text-destructive">{updateError}</p> : null}
                     </CardContent>
                   </Card>
 

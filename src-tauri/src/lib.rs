@@ -8,6 +8,8 @@ use russh::ChannelMsg;
 use serde::{Deserialize, Serialize};
 use ssh_client::{SshConnectParams, SshHandle};
 use std::collections::HashMap;
+use std::io::Write;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -53,6 +55,40 @@ struct SshHostMetricsResponse {
     upload_kbps: f64,
     download_kbps: f64,
 }
+
+#[derive(Debug, Clone, Deserialize)]
+struct GithubReleaseAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    html_url: String,
+    assets: Vec<GithubReleaseAsset>,
+}
+
+#[derive(Debug, Serialize)]
+struct UpdateCheckResponse {
+    current_version: String,
+    latest_version: Option<String>,
+    update_available: bool,
+    available_for_os: bool,
+    os: String,
+    arch: String,
+    release_url: Option<String>,
+    asset_name: Option<String>,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct UpdateInstallResponse {
+    installer_path: String,
+    message: String,
+}
+
+const UPDATE_REPO: &str = "hdmain/rsshu";
 
 #[derive(Debug, Serialize)]
 struct SshShellStartResponse {
@@ -280,6 +316,260 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+fn current_update_os() -> String {
+    std::env::consts::OS.to_string()
+}
+
+fn current_update_arch() -> String {
+    std::env::consts::ARCH.to_string()
+}
+
+fn normalize_version(version: &str) -> &str {
+    version.trim().trim_start_matches('v')
+}
+
+fn version_parts(version: &str) -> Vec<u64> {
+    normalize_version(version)
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|p| !p.is_empty())
+        .filter_map(|p| p.parse::<u64>().ok())
+        .collect()
+}
+
+fn is_newer_version(latest: &str, current: &str) -> bool {
+    let latest_parts = version_parts(latest);
+    let current_parts = version_parts(current);
+    let len = latest_parts.len().max(current_parts.len());
+    for i in 0..len {
+        let l = latest_parts.get(i).copied().unwrap_or(0);
+        let c = current_parts.get(i).copied().unwrap_or(0);
+        if l != c {
+            return l > c;
+        }
+    }
+    false
+}
+
+fn asset_matches_arch(name: &str, arch: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    match arch {
+        "x86_64" => {
+            !n.contains("aarch64")
+                && !n.contains("arm64")
+                && (n.contains("x64") || n.contains("x86_64") || n.contains("amd64"))
+        }
+        "aarch64" => n.contains("aarch64") || n.contains("arm64"),
+        _ => n.contains(arch),
+    }
+}
+
+fn asset_install_priority(name: &str, os: &str, arch: &str) -> Option<u8> {
+    let n = name.to_ascii_lowercase();
+    if !asset_matches_arch(&n, arch) {
+        return None;
+    }
+
+    match os {
+        "windows" => {
+            if n.ends_with(".exe") && n.contains("setup") {
+                Some(0)
+            } else if n.ends_with(".msi") {
+                Some(1)
+            } else if n.ends_with(".exe") {
+                Some(2)
+            } else {
+                None
+            }
+        }
+        "linux" => {
+            if n.ends_with(".appimage") {
+                Some(0)
+            } else if n.ends_with(".deb") {
+                Some(1)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn matching_update_asset(
+    release: &GithubRelease,
+    os: &str,
+    arch: &str,
+) -> Option<GithubReleaseAsset> {
+    release
+        .assets
+        .iter()
+        .filter_map(|asset| asset_install_priority(&asset.name, os, arch).map(|p| (p, asset)))
+        .min_by_key(|(priority, _)| *priority)
+        .map(|(_, asset)| asset.clone())
+}
+
+fn fetch_latest_release() -> Result<GithubRelease> {
+    let url = format!("https://api.github.com/repos/{UPDATE_REPO}/releases/latest");
+    reqwest::blocking::Client::new()
+        .get(url)
+        .header(
+            reqwest::header::USER_AGENT,
+            format!("RSSHU/{}", env!("CARGO_PKG_VERSION")),
+        )
+        .send()
+        .context("Failed to query GitHub Releases")?
+        .error_for_status()
+        .context("GitHub Releases returned an error")?
+        .json::<GithubRelease>()
+        .context("Failed to parse GitHub release response")
+}
+
+fn build_update_check_response(release: GithubRelease) -> UpdateCheckResponse {
+    let current_version = env!("CARGO_PKG_VERSION").to_string();
+    let latest_version = normalize_version(&release.tag_name).to_string();
+    let os = current_update_os();
+    let arch = current_update_arch();
+    let asset = matching_update_asset(&release, &os, &arch);
+    let available_for_os = asset.is_some();
+    let newer = is_newer_version(&latest_version, &current_version);
+    let update_available = newer && available_for_os;
+    let message = if update_available {
+        format!("Update {latest_version} is available for {os}-{arch}.")
+    } else if newer {
+        format!("Update {latest_version} exists, but no installer asset matches {os}-{arch}.")
+    } else {
+        format!("RSSHU is up to date for {os}-{arch}.")
+    };
+
+    UpdateCheckResponse {
+        current_version,
+        latest_version: Some(latest_version),
+        update_available,
+        available_for_os,
+        os,
+        arch,
+        release_url: Some(release.html_url),
+        asset_name: asset.map(|a| a.name),
+        message,
+    }
+}
+
+fn check_update_blocking() -> Result<(UpdateCheckResponse, Option<GithubReleaseAsset>)> {
+    let release = fetch_latest_release()?;
+    let os = current_update_os();
+    let arch = current_update_arch();
+    let asset = matching_update_asset(&release, &os, &arch);
+    let response = build_update_check_response(release);
+    Ok((response, asset))
+}
+
+fn safe_asset_filename(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn download_update_asset(app: &AppHandle, asset: &GithubReleaseAsset) -> Result<std::path::PathBuf> {
+    let dir = app
+        .path()
+        .app_cache_dir()
+        .context("Failed to resolve app cache directory")?
+        .join("updates");
+    std::fs::create_dir_all(&dir).context("Failed to create update cache directory")?;
+    let path = dir.join(safe_asset_filename(&asset.name));
+    let bytes = reqwest::blocking::Client::new()
+        .get(&asset.browser_download_url)
+        .header(
+            reqwest::header::USER_AGENT,
+            format!("RSSHU/{}", env!("CARGO_PKG_VERSION")),
+        )
+        .send()
+        .context("Failed to download update installer")?
+        .error_for_status()
+        .context("Update installer download returned an error")?
+        .bytes()
+        .context("Failed to read update installer")?;
+    let mut file = std::fs::File::create(&path).context("Failed to create update installer file")?;
+    file.write_all(&bytes)
+        .context("Failed to write update installer file")?;
+    Ok(path)
+}
+
+#[cfg(target_os = "windows")]
+fn launch_update_installer(path: &std::path::Path) -> Result<String> {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if name.ends_with(".msi") {
+        Command::new("msiexec")
+            .arg("/i")
+            .arg(path)
+            .arg("/passive")
+            .arg("/norestart")
+            .spawn()
+            .context("Failed to start MSI installer")?;
+        return Ok("Started the Windows MSI installer.".to_string());
+    }
+
+    Command::new(path)
+        .arg("/S")
+        .spawn()
+        .context("Failed to start Windows installer")?;
+    Ok("Started the Windows installer.".to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn launch_update_installer(path: &std::path::Path) -> Result<String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if name.ends_with(".appimage") {
+        let mut perms = std::fs::metadata(path)
+            .context("Failed to read AppImage metadata")?
+            .permissions();
+        perms.set_mode(perms.mode() | 0o755);
+        std::fs::set_permissions(path, perms).context("Failed to mark AppImage executable")?;
+        Command::new(path)
+            .spawn()
+            .context("Failed to launch AppImage update")?;
+        return Ok("Downloaded and launched the AppImage update.".to_string());
+    }
+
+    if name.ends_with(".deb") {
+        let quoted_path = path.to_string_lossy().replace('\'', "'\\''");
+        let installer = format!("apt install -y '{quoted_path}' || dpkg -i '{quoted_path}'");
+        Command::new("pkexec")
+            .args(["sh", "-c", &installer])
+            .spawn()
+            .context("Failed to start Debian package installer with pkexec")?;
+        return Ok("Started the Debian package installer.".to_string());
+    }
+
+    anyhow::bail!("No automatic installer is available for this OS asset: {name}");
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+fn launch_update_installer(path: &std::path::Path) -> Result<String> {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    anyhow::bail!("No automatic installer is available for this OS asset: {name}");
+}
+
 #[tauri::command]
 async fn ssh_test_connection(req: SshConnectRequest) -> Result<String, String> {
     println!(
@@ -491,6 +781,41 @@ async fn ssh_fetch_host_metrics(
     })
         .await
         .map_err(|e| format!("Metrics worker thread failed: {e}"))?
+}
+
+#[tauri::command]
+async fn app_check_update() -> Result<UpdateCheckResponse, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        check_update_blocking()
+            .map(|(response, _)| response)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("Update check worker thread failed: {e}"))?
+}
+
+#[tauri::command]
+async fn app_install_update(app: AppHandle) -> Result<UpdateInstallResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (check, asset) = check_update_blocking().map_err(|e| e.to_string())?;
+        if !check.update_available {
+            return Err(check.message);
+        }
+        let asset = asset.ok_or_else(|| {
+            format!(
+                "No installer asset matches {}-{}.",
+                check.os, check.arch
+            )
+        })?;
+        let path = download_update_asset(&app, &asset).map_err(|e| e.to_string())?;
+        let message = launch_update_installer(&path).map_err(|e| e.to_string())?;
+        Ok(UpdateInstallResponse {
+            installer_path: path.to_string_lossy().to_string(),
+            message,
+        })
+    })
+    .await
+    .map_err(|e| format!("Update install worker thread failed: {e}"))?
 }
 
 async fn ssh_fetch_host_metrics_async(handle: &SshHandle) -> Result<SshHostMetricsResponse, String> {
@@ -729,6 +1054,8 @@ pub fn run() {
             ssh_read_output,
             ssh_close_shell,
             ssh_fetch_host_metrics,
+            app_check_update,
+            app_install_update,
             sftp::sftp_connect,
             sftp::sftp_list,
             sftp::sftp_realpath,
