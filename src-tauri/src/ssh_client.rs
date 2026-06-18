@@ -70,21 +70,30 @@ pub struct SshConnectParams {
     pub passphrase: Option<String>,
 }
 
-pub async fn connect_async(params: SshConnectParams) -> Result<SshHandle> {
+pub async fn connect_async(
+    params: SshConnectParams,
+    proxy_state: crate::proxy::ProxyState,
+) -> Result<SshHandle> {
     let config = Arc::new(client::Config {
         inactivity_timeout: Some(Duration::from_secs(300)),
         ..Default::default()
     });
-    let addr = (params.host.as_str(), params.port);
-    let mut handle =
-        client::connect(config, addr, SshClientHandler).await.context("SSH connect failed")?;
+    let stream = crate::proxy::open_connection(&proxy_state, &params.host, params.port, true)
+        .await
+        .context("Failed to open connection (proxy or direct)")?;
+    let mut handle = client::connect_stream(config, stream, SshClientHandler)
+        .await
+        .context("SSH connect failed")?;
 
     authenticate_inner(&mut handle, &params, || {}).await?;
     Ok(handle)
 }
 
-pub fn connect(params: &SshConnectParams) -> Result<SshHandle> {
-    block_on(connect_async(params.clone()))
+pub fn connect(
+    params: &SshConnectParams,
+    proxy_state: &crate::proxy::ProxyState,
+) -> Result<SshHandle> {
+    block_on(connect_async(params.clone(), proxy_state.clone()))
 }
 
 pub async fn authenticate_session(

@@ -74,7 +74,7 @@ type SessionTab = {
 type SshProgressPayload = { line: string };
 type Screen = "hosts" | "terminal" | "sftp";
 type HostStatus = "checking" | "online" | "offline" | "connecting";
-type SidebarSection = "hosts" | "keychain" | "forwarding" | "snippets" | "known" | "logs" | "settings";
+type SidebarSection = "hosts" | "keychain" | "proxy" | "snippets" | "known" | "logs" | "settings";
 type TerminalState = "empty" | "connecting" | "connected" | "disconnected" | "error";
 type SftpState = "empty" | "connecting" | "connected" | "error";
 type ShellStartResponse = { session_id: string };
@@ -106,6 +106,73 @@ type UpdateInstallResponse = {
   installer_path: string;
   message: string;
 };
+type ProxyType = "socks5" | "socks4" | "http" | "https";
+type ProxyServer = {
+  id: string;
+  name: string;
+  type: ProxyType;
+  host: string;
+  port: number;
+  username: string;
+  password: string;
+};
+type ProxyConfig = {
+  enabled: boolean;
+  activeServerId: string | null;
+  applySsh: boolean;
+  applyHttp: boolean;
+  lockdown: boolean;
+};
+type ProxyStats = {
+  totalBytes: number;
+  serverBytes: Record<string, number>;
+};
+type ProxyStore = {
+  servers: ProxyServer[];
+  config: ProxyConfig;
+  stats: ProxyStats;
+};
+type ProxyTestResponse = { ok: boolean; message: string };
+type ProxyServerDraft = {
+  id: string | null;
+  name: string;
+  type: ProxyType;
+  host: string;
+  port: string;
+  username: string;
+  password: string;
+};
+
+const defaultProxyConfig: ProxyConfig = {
+  enabled: false,
+  activeServerId: null,
+  applySsh: true,
+  applyHttp: true,
+  lockdown: false,
+};
+
+const defaultProxyStore: ProxyStore = {
+  servers: [],
+  config: defaultProxyConfig,
+  stats: { totalBytes: 0, serverBytes: {} },
+};
+
+const emptyProxyServerDraft: ProxyServerDraft = {
+  id: null,
+  name: "",
+  type: "socks5",
+  host: "",
+  port: "1080",
+  username: "",
+  password: "",
+};
+
+function formatProxyBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 ** 2) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 ** 3) return `${(n / 1024 ** 2).toFixed(1)} MB`;
+  return `${(n / 1024 ** 3).toFixed(2)} GB`;
+}
 
 type HostDraft = {
   id: string | null;
@@ -322,6 +389,14 @@ function App() {
   const [updateBusy, setUpdateBusy] = useState(false);
   const [updateError, setUpdateError] = useState("");
   const [updateInfo, setUpdateInfo] = useState("");
+  const [proxyStore, setProxyStore] = useState<ProxyStore>(defaultProxyStore);
+  const [proxyConfigDraft, setProxyConfigDraft] = useState<ProxyConfig>(defaultProxyConfig);
+  const [proxyBusy, setProxyBusy] = useState(false);
+  const [proxyInfo, setProxyInfo] = useState("");
+  const [proxyError, setProxyError] = useState("");
+  const [isProxyServerModalOpen, setIsProxyServerModalOpen] = useState(false);
+  const [proxyServerDraft, setProxyServerDraft] = useState<ProxyServerDraft>(emptyProxyServerDraft);
+  const [showProxyPassword, setShowProxyPassword] = useState(false);
   const [quickNavKey, setQuickNavKey] = useState("F2");
   const [capturingKey, setCapturingKey] = useState(false);
   const [connectCounts, setConnectCounts] = useState<Record<string, { ssh: number; sftp: number }>>(
@@ -397,6 +472,34 @@ function App() {
       // ignore
     }
   }, []);
+
+  useEffect(() => {
+    void invoke<ProxyStore>("proxy_get")
+      .then((store) => {
+        setProxyStore(store);
+        setProxyConfigDraft(store.config);
+      })
+      .catch(() => {
+        // ignore — backend may not be ready yet
+      });
+  }, []);
+
+  useEffect(() => {
+    if (sidebarSection !== "proxy") return;
+    const timer = window.setInterval(() => {
+      void invoke<ProxyStore>("proxy_get")
+        .then((store) => {
+          setProxyStore((prev) => ({
+            ...prev,
+            stats: store.stats,
+          }));
+        })
+        .catch(() => {
+          // ignore
+        });
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [sidebarSection]);
 
   useEffect(() => {
     if (!autoInstallUpdates || autoUpdateCheckedRef.current) return;
@@ -685,6 +788,107 @@ function App() {
     }
   }
 
+  async function saveProxyConfig() {
+    setProxyBusy(true);
+    setProxyError("");
+    setProxyInfo("");
+    try {
+      const store = await invoke<ProxyStore>("proxy_set_config", { config: proxyConfigDraft });
+      setProxyStore(store);
+      setProxyConfigDraft(store.config);
+      setProxyInfo("Proxy options saved.");
+    } catch (err) {
+      setProxyError(String(err));
+    } finally {
+      setProxyBusy(false);
+    }
+  }
+
+  async function saveProxyServer() {
+    setProxyBusy(true);
+    setProxyError("");
+    setProxyInfo("");
+    try {
+      const port = Number.parseInt(proxyServerDraft.port, 10);
+      if (!proxyServerDraft.host.trim() || !port) {
+        throw new Error("Host and port are required.");
+      }
+      const server: ProxyServer = {
+        id: proxyServerDraft.id ?? "",
+        name: proxyServerDraft.name.trim() || `${proxyServerDraft.host}:${port}`,
+        type: proxyServerDraft.type,
+        host: proxyServerDraft.host.trim(),
+        port,
+        username: proxyServerDraft.username,
+        password: proxyServerDraft.password,
+      };
+      const store = await invoke<ProxyStore>("proxy_upsert_server", { server });
+      setProxyStore(store);
+      setProxyConfigDraft(store.config);
+      setIsProxyServerModalOpen(false);
+      setProxyServerDraft(emptyProxyServerDraft);
+      setProxyInfo(server.id ? "Proxy server updated." : "Proxy server added.");
+    } catch (err) {
+      setProxyError(String(err));
+    } finally {
+      setProxyBusy(false);
+    }
+  }
+
+  async function deleteProxyServer(id: string) {
+    setProxyBusy(true);
+    setProxyError("");
+    setProxyInfo("");
+    try {
+      const store = await invoke<ProxyStore>("proxy_delete_server", { id });
+      setProxyStore(store);
+      setProxyConfigDraft(store.config);
+      setProxyInfo("Proxy server removed.");
+    } catch (err) {
+      setProxyError(String(err));
+    } finally {
+      setProxyBusy(false);
+    }
+  }
+
+  async function testProxyConnection(serverId?: string) {
+    setProxyBusy(true);
+    setProxyError("");
+    setProxyInfo("");
+    try {
+      const result = await invoke<ProxyTestResponse>("proxy_test", { serverId: serverId ?? null });
+      if (result.ok) {
+        setProxyInfo(result.message);
+      } else {
+        setProxyError(result.message);
+      }
+    } catch (err) {
+      setProxyError(String(err));
+    } finally {
+      setProxyBusy(false);
+    }
+  }
+
+  function openNewProxyServerModal() {
+    setProxyServerDraft(emptyProxyServerDraft);
+    setShowProxyPassword(false);
+    setIsProxyServerModalOpen(true);
+  }
+
+  function openEditProxyServerModal(server: ProxyServer) {
+    setProxyServerDraft({
+      id: server.id,
+      name: server.name,
+      type: server.type,
+      host: server.host,
+      port: String(server.port),
+      username: server.username,
+      password: server.password,
+    });
+    setShowProxyPassword(false);
+    setIsProxyServerModalOpen(true);
+  }
+
   const filteredHosts = useMemo(() => {
     const term = search.trim().toLowerCase();
     if (!term) return hosts;
@@ -953,7 +1157,7 @@ function App() {
   const sidebarItems: Array<{ key: SidebarSection; label: string; icon: ReactNode }> = [
     { key: "hosts", label: "Hosts", icon: <Server className="h-4 w-4" /> },
     { key: "keychain", label: "Keychain", icon: <KeyRound className="h-4 w-4" /> },
-    { key: "forwarding", label: "Port Forwarding", icon: <Network className="h-4 w-4" /> },
+    { key: "proxy", label: "Proxy", icon: <Network className="h-4 w-4" /> },
     { key: "snippets", label: "Snippets", icon: <Terminal className="h-4 w-4" /> },
     { key: "known", label: "Known Hosts", icon: <Laptop className="h-4 w-4" /> },
     { key: "logs", label: "Logs", icon: <Logs className="h-4 w-4" /> },
@@ -1561,6 +1765,219 @@ function App() {
                     </div>
                   ))}
                 </>
+              ) : sidebarSection === "proxy" ? (
+                <div className="grid max-w-6xl gap-4 xl:grid-cols-2">
+                  <Card className="app-panel border shadow-xl">
+                    <CardHeader>
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="min-w-0">
+                          <CardTitle className="app-text-strong">Active proxy</CardTitle>
+                          <CardDescription className="app-text-muted">
+                            Choose which proxy server to use and how traffic is routed.
+                          </CardDescription>
+                        </div>
+                        <button
+                          type="button"
+                          aria-label="Enable proxy"
+                          onClick={() =>
+                            setProxyConfigDraft((prev) => ({ ...prev, enabled: !prev.enabled }))
+                          }
+                          className={`relative h-6 w-11 shrink-0 rounded-full transition ${
+                            proxyConfigDraft.enabled ? "app-toggle-on" : "app-toggle-off"
+                          }`}
+                        >
+                          <span
+                            className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition ${
+                              proxyConfigDraft.enabled ? "left-[22px]" : "left-0.5"
+                            }`}
+                          />
+                        </button>
+                      </div>
+                    </CardHeader>
+                    <CardContent className="space-y-4">
+                      <div className="space-y-1.5">
+                        <p className="app-text-muted text-xs font-medium uppercase tracking-wide">
+                          Proxy server
+                        </p>
+                        <select
+                          value={proxyConfigDraft.activeServerId ?? ""}
+                          onChange={(e) =>
+                            setProxyConfigDraft((prev) => ({
+                              ...prev,
+                              activeServerId: e.target.value || null,
+                            }))
+                          }
+                          className="app-card app-chrome-border app-text-strong h-9 w-full rounded-md border px-2 text-sm"
+                        >
+                          <option value="">— select server —</option>
+                          {proxyStore.servers.map((server) => (
+                            <option key={server.id} value={server.id}>
+                              {server.name} ({server.type.toUpperCase()} {server.host}:{server.port})
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+
+                      <div className="app-card app-soft grid gap-2 rounded-md px-3 py-3 sm:grid-cols-2">
+                        <div>
+                          <p className="app-text-muted text-xs">Total through all proxies</p>
+                          <p className="app-text-strong font-mono text-lg">
+                            {formatProxyBytes(proxyStore.stats.totalBytes)}
+                          </p>
+                        </div>
+                        <div>
+                          <p className="app-text-muted text-xs">Selected proxy</p>
+                          <p className="app-text-strong font-mono text-lg">
+                            {proxyConfigDraft.activeServerId
+                              ? formatProxyBytes(
+                                  proxyStore.stats.serverBytes[proxyConfigDraft.activeServerId] ?? 0,
+                                )
+                              : "—"}
+                          </p>
+                        </div>
+                      </div>
+
+                      <div className="space-y-2">
+                        {[
+                          {
+                            key: "applySsh" as const,
+                            title: "Apply to SSH / SFTP",
+                            desc: "Tunnel SSH and SFTP connections through the proxy.",
+                          },
+                          {
+                            key: "applyHttp" as const,
+                            title: "Apply to HTTP traffic",
+                            desc: "GitHub sync, update checks, and installer downloads.",
+                          },
+                          {
+                            key: "lockdown" as const,
+                            title: "Lockdown (no direct fallback)",
+                            desc: "Block direct connections when proxy is enabled for that scope.",
+                          },
+                        ].map(({ key, title, desc }) => (
+                          <div
+                            key={key}
+                            className="app-card app-soft flex items-center justify-between rounded-md px-3 py-2"
+                          >
+                            <div className="min-w-0 pr-3">
+                              <p className="app-text-strong text-sm font-medium">{title}</p>
+                              <p className="app-text-muted text-xs">{desc}</p>
+                            </div>
+                            <button
+                              type="button"
+                              aria-label={title}
+                              onClick={() =>
+                                setProxyConfigDraft((prev) => ({ ...prev, [key]: !prev[key] }))
+                              }
+                              className={`relative h-6 w-11 shrink-0 rounded-full transition ${
+                                proxyConfigDraft[key] ? "app-toggle-on" : "app-toggle-off"
+                              }`}
+                            >
+                              <span
+                                className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition ${
+                                  proxyConfigDraft[key] ? "left-[22px]" : "left-0.5"
+                                }`}
+                              />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Button size="sm" disabled={proxyBusy} onClick={() => void saveProxyConfig()}>
+                          Save options
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={
+                            proxyBusy ||
+                            !proxyConfigDraft.activeServerId ||
+                            proxyStore.servers.length === 0
+                          }
+                          onClick={() => void testProxyConnection(proxyConfigDraft.activeServerId ?? undefined)}
+                        >
+                          Test selected
+                        </Button>
+                      </div>
+                    </CardContent>
+                  </Card>
+
+                  <Card className="app-panel border shadow-xl">
+                    <CardHeader>
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="min-w-0">
+                          <CardTitle className="app-text-strong">Proxy servers</CardTitle>
+                          <CardDescription className="app-text-muted">
+                            Add SOCKS5, SOCKS4, HTTP, or HTTPS proxy servers. Credentials are stored locally on disk.
+                          </CardDescription>
+                        </div>
+                        <Button size="sm" onClick={openNewProxyServerModal}>
+                          <Plus className="mr-1.5 h-3.5 w-3.5" />
+                          Add
+                        </Button>
+                      </div>
+                    </CardHeader>
+                    <CardContent className="space-y-3">
+                      {proxyStore.servers.length === 0 ? (
+                        <p className="app-text-muted py-6 text-center text-sm">
+                          No proxy servers yet. Click Add to create one.
+                        </p>
+                      ) : (
+                        proxyStore.servers.map((server) => (
+                          <div
+                            key={server.id}
+                            className={`app-card app-soft rounded-md px-3 py-3 ${
+                              proxyConfigDraft.activeServerId === server.id
+                                ? "ring-1 ring-emerald-500/40"
+                                : ""
+                            }`}
+                          >
+                            <div className="flex items-start justify-between gap-3">
+                              <div className="min-w-0">
+                                <p className="app-text-strong truncate font-medium">{server.name}</p>
+                                <p className="app-text-muted truncate font-mono text-xs">
+                                  {server.type.toUpperCase()} · {server.host}:{server.port}
+                                </p>
+                                <p className="app-text-muted mt-1 text-xs">
+                                  {formatProxyBytes(proxyStore.stats.serverBytes[server.id] ?? 0)} transferred
+                                </p>
+                              </div>
+                              <div className="flex shrink-0 items-center gap-1">
+                                <Button
+                                  size="sm"
+                                  variant="ghost"
+                                  disabled={proxyBusy}
+                                  onClick={() => openEditProxyServerModal(server)}
+                                >
+                                  <Edit3 className="h-3.5 w-3.5" />
+                                </Button>
+                                <Button
+                                  size="sm"
+                                  variant="ghost"
+                                  disabled={proxyBusy}
+                                  onClick={() => void testProxyConnection(server.id)}
+                                >
+                                  <RefreshCw className="h-3.5 w-3.5" />
+                                </Button>
+                                <Button
+                                  size="sm"
+                                  variant="ghost"
+                                  disabled={proxyBusy}
+                                  onClick={() => void deleteProxyServer(server.id)}
+                                >
+                                  <Trash2 className="h-3.5 w-3.5 text-destructive" />
+                                </Button>
+                              </div>
+                            </div>
+                          </div>
+                        ))
+                      )}
+                      {proxyInfo ? <p className="text-xs text-emerald-400">{proxyInfo}</p> : null}
+                      {proxyError ? <p className="text-xs text-destructive">{proxyError}</p> : null}
+                    </CardContent>
+                  </Card>
+                </div>
               ) : sidebarSection === "settings" ? (
                 <div className="max-w-2xl space-y-4">
                   <Card className="app-panel border shadow-xl">
@@ -2018,6 +2435,103 @@ function App() {
             </div>
           </section>
         </main>
+
+        {isProxyServerModalOpen ? (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm">
+            <Card className="app-modal w-full max-w-xl border">
+              <CardHeader>
+                <CardTitle>{proxyServerDraft.id ? "Edit proxy server" : "Add proxy server"}</CardTitle>
+                <CardDescription>SOCKS5, SOCKS4, HTTP, or HTTPS proxy endpoint.</CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                <Input
+                  placeholder="Display name (optional)"
+                  value={proxyServerDraft.name}
+                  onChange={(e) => setProxyServerDraft((prev) => ({ ...prev, name: e.target.value }))}
+                />
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="space-y-1.5">
+                    <p className="app-text-muted text-xs font-medium uppercase tracking-wide">Type</p>
+                    <select
+                      value={proxyServerDraft.type}
+                      onChange={(e) =>
+                        setProxyServerDraft((prev) => ({
+                          ...prev,
+                          type: e.target.value as ProxyType,
+                        }))
+                      }
+                      className="app-card app-chrome-border app-text-strong h-9 w-full rounded-md border px-2 text-sm"
+                    >
+                      <option value="socks5">SOCKS5</option>
+                      <option value="socks4">SOCKS4</option>
+                      <option value="http">HTTP</option>
+                      <option value="https">HTTPS</option>
+                    </select>
+                  </div>
+                  <div className="space-y-1.5">
+                    <p className="app-text-muted text-xs font-medium uppercase tracking-wide">Port</p>
+                    <Input
+                      type="number"
+                      min={1}
+                      max={65535}
+                      value={proxyServerDraft.port}
+                      onChange={(e) => setProxyServerDraft((prev) => ({ ...prev, port: e.target.value }))}
+                    />
+                  </div>
+                </div>
+                <Input
+                  placeholder="Host (127.0.0.1 or proxy.example.com)"
+                  value={proxyServerDraft.host}
+                  onChange={(e) => setProxyServerDraft((prev) => ({ ...prev, host: e.target.value }))}
+                />
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <Input
+                    placeholder={
+                      proxyServerDraft.type === "socks4" ? "SOCKS4 user ID (optional)" : "Username (optional)"
+                    }
+                    value={proxyServerDraft.username}
+                    onChange={(e) => setProxyServerDraft((prev) => ({ ...prev, username: e.target.value }))}
+                  />
+                  <div className="relative">
+                    <Input
+                      type={showProxyPassword ? "text" : "password"}
+                      placeholder={
+                        proxyServerDraft.type === "socks4" ? "Not used by SOCKS4" : "Password (optional)"
+                      }
+                      disabled={proxyServerDraft.type === "socks4"}
+                      value={proxyServerDraft.password}
+                      onChange={(e) => setProxyServerDraft((prev) => ({ ...prev, password: e.target.value }))}
+                      className="pr-9"
+                    />
+                    <button
+                      type="button"
+                      aria-label={showProxyPassword ? "Hide password" : "Show password"}
+                      disabled={proxyServerDraft.type === "socks4"}
+                      onClick={() => setShowProxyPassword((v) => !v)}
+                      className="app-text-muted absolute right-2 top-1/2 -translate-y-1/2 disabled:opacity-40"
+                    >
+                      {showProxyPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                    </button>
+                  </div>
+                </div>
+                <div className="flex justify-end gap-2 pt-2">
+                  <Button
+                    variant="ghost"
+                    onClick={() => {
+                      setIsProxyServerModalOpen(false);
+                      setProxyServerDraft(emptyProxyServerDraft);
+                    }}
+                  >
+                    Cancel
+                  </Button>
+                  <Button disabled={proxyBusy} onClick={() => void saveProxyServer()}>
+                    {proxyServerDraft.id ? "Save" : "Add server"}
+                  </Button>
+                </div>
+              </CardContent>
+            </Card>
+          </div>
+        ) : null}
 
         {isHostModalOpen ? (
           <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm">

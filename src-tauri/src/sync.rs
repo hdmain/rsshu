@@ -3,7 +3,7 @@ use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use rand::RngCore;
-use reqwest::blocking::Client;
+use crate::proxy::{build_http_client, ProxyState};
 use reqwest::header::{ACCEPT, AUTHORIZATION, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -203,10 +203,8 @@ fn parse_note(note: &str, key: &[u8; KEY_LEN]) -> Result<(String, String), Strin
     Ok((uuid, payload))
 }
 
-fn client() -> Result<Client, String> {
-    Client::builder()
-        .build()
-        .map_err(|e| format!("http client init failed: {e}"))
+fn client(proxy_state: &ProxyState) -> Result<reqwest::blocking::Client, String> {
+    build_http_client(proxy_state)
 }
 
 fn gist_headers(req: reqwest::blocking::RequestBuilder, token: &str) -> reqwest::blocking::RequestBuilder {
@@ -215,50 +213,58 @@ fn gist_headers(req: reqwest::blocking::RequestBuilder, token: &str) -> reqwest:
         .header(AUTHORIZATION, format!("Bearer {token}"))
 }
 
-fn create_gist(token: &str, note_content: &str) -> Result<String, String> {
+fn create_gist(token: &str, note_content: &str, proxy_state: &ProxyState) -> Result<String, String> {
     let body = json!({
       "description": "RSSHU encrypted sync note",
       "public": false,
       "files": { GIST_FILENAME: { "content": note_content } }
     });
-    let res = gist_headers(client()?.post("https://api.github.com/gists"), token)
+    let req_bytes = note_content.len() as u64;
+    let res = gist_headers(client(proxy_state)?.post("https://api.github.com/gists"), token)
         .json(&body)
         .send()
         .map_err(|e| format!("create gist failed: {e}"))?;
     if !res.status().is_success() {
         return Err(format!("create gist failed status {}", res.status()));
     }
-    let value: serde_json::Value = res.json().map_err(|e| format!("parse gist response: {e}"))?;
+    let bytes = res.bytes().map_err(|e| format!("read gist response: {e}"))?;
+    proxy_state.record_http_bytes(req_bytes + bytes.len() as u64);
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| format!("parse gist response: {e}"))?;
     value["id"]
         .as_str()
         .map(|s| s.to_string())
         .ok_or_else(|| "missing gist id".to_string())
 }
 
-fn update_gist(token: &str, gist_id: &str, note_content: &str) -> Result<(), String> {
+fn update_gist(token: &str, gist_id: &str, note_content: &str, proxy_state: &ProxyState) -> Result<(), String> {
     let body = json!({
       "files": { GIST_FILENAME: { "content": note_content } }
     });
+    let req_bytes = note_content.len() as u64;
     let url = format!("https://api.github.com/gists/{gist_id}");
-    let res = gist_headers(client()?.patch(url), token)
+    let res = gist_headers(client(proxy_state)?.patch(url), token)
         .json(&body)
         .send()
         .map_err(|e| format!("update gist failed: {e}"))?;
     if !res.status().is_success() {
         return Err(format!("update gist failed status {}", res.status()));
     }
+    let bytes = res.bytes().map_err(|e| format!("read gist response: {e}"))?;
+    proxy_state.record_http_bytes(req_bytes + bytes.len() as u64);
     Ok(())
 }
 
-fn fetch_gist_note(token: &str, gist_id: &str) -> Result<String, String> {
+fn fetch_gist_note(token: &str, gist_id: &str, proxy_state: &ProxyState) -> Result<String, String> {
     let url = format!("https://api.github.com/gists/{gist_id}");
-    let res = gist_headers(client()?.get(url), token)
+    let res = gist_headers(client(proxy_state)?.get(url), token)
         .send()
         .map_err(|e| format!("fetch gist failed: {e}"))?;
     if !res.status().is_success() {
         return Err(format!("fetch gist failed status {}", res.status()));
     }
-    let value: serde_json::Value = res.json().map_err(|e| format!("parse gist response: {e}"))?;
+    let bytes = res.bytes().map_err(|e| format!("read gist response: {e}"))?;
+    proxy_state.record_http_bytes(bytes.len() as u64);
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| format!("parse gist response: {e}"))?;
     value["files"][GIST_FILENAME]["content"]
         .as_str()
         .map(|s| s.to_string())
@@ -285,6 +291,7 @@ pub fn sync_enable(
     app: AppHandle,
     sync: State<'_, SyncState>,
     vault_state: State<'_, Vault>,
+    proxy_state: State<'_, crate::proxy::ProxyState>,
     req: SyncEnableRequest,
 ) -> Result<SyncEnableResponse, String> {
     if req.github_token.trim().is_empty() {
@@ -298,11 +305,12 @@ pub fn sync_enable(
         raw
     };
     let key_b64 = B64.encode(key);
+    let proxy = (*proxy_state).clone();
     let gist_id = if let Some(g) = req.gist_id.as_ref().filter(|v| !v.trim().is_empty()) {
         g.to_string()
     } else {
         let (_, note) = make_note("[]", &key)?;
-        create_gist(&req.github_token, &note)?
+        create_gist(&req.github_token, &note, &proxy)?
     };
     let cfg = SyncConfig {
         enabled: true,
@@ -354,6 +362,7 @@ pub fn sync_push(
     app: AppHandle,
     sync: State<'_, SyncState>,
     vault_state: State<'_, Vault>,
+    proxy_state: State<'_, crate::proxy::ProxyState>,
     hosts_json: String,
 ) -> Result<(), String> {
     let (cfg, should_skip) = {
@@ -376,7 +385,8 @@ pub fn sync_push(
     let secrets = resolve_sync_secrets(&app, &vault_state, &cfg)?;
     let key = decode_key(&secrets.key_b64)?;
     let (uuid, note) = make_note(&hosts_json, &key)?;
-    update_gist(&secrets.github_token, &cfg.gist_id, &note)?;
+    let proxy = (*proxy_state).clone();
+    update_gist(&secrets.github_token, &cfg.gist_id, &note, &proxy)?;
     let mut inner = sync.inner.lock().map_err(|_| "Sync lock poisoned".to_string())?;
     inner.last_payload = Some(hosts_json);
     inner.last_uuid = Some(uuid);
@@ -388,6 +398,7 @@ pub fn sync_pull(
     app: AppHandle,
     sync: State<'_, SyncState>,
     vault_state: State<'_, Vault>,
+    proxy_state: State<'_, crate::proxy::ProxyState>,
 ) -> Result<String, String> {
     let cfg = {
         let mut inner = sync.inner.lock().map_err(|_| "Sync lock poisoned".to_string())?;
@@ -401,7 +412,8 @@ pub fn sync_pull(
     };
     let secrets = resolve_sync_secrets(&app, &vault_state, &cfg)?;
     let key = decode_key(&secrets.key_b64)?;
-    let note = fetch_gist_note(&secrets.github_token, &cfg.gist_id)?;
+    let proxy = (*proxy_state).clone();
+    let note = fetch_gist_note(&secrets.github_token, &cfg.gist_id, &proxy)?;
     let (uuid, payload) = parse_note(&note, &key)?;
     let mut inner = sync.inner.lock().map_err(|_| "Sync lock poisoned".to_string())?;
     inner.last_payload = Some(payload.clone());
@@ -414,6 +426,7 @@ pub fn sync_poll_updates(
     app: AppHandle,
     sync: State<'_, SyncState>,
     vault_state: State<'_, Vault>,
+    proxy_state: State<'_, crate::proxy::ProxyState>,
 ) -> Result<SyncPollResponse, String> {
     let (cfg, last_uuid) = {
         let mut inner = sync.inner.lock().map_err(|_| "Sync lock poisoned".to_string())?;
@@ -437,7 +450,8 @@ pub fn sync_poll_updates(
 
     let secrets = resolve_sync_secrets(&app, &vault_state, &cfg)?;
     let key = decode_key(&secrets.key_b64)?;
-    let note = fetch_gist_note(&secrets.github_token, &cfg.gist_id)?;
+    let proxy = (*proxy_state).clone();
+    let note = fetch_gist_note(&secrets.github_token, &cfg.gist_id, &proxy)?;
     let (remote_uuid, payload) = parse_note(&note, &key)?;
 
     if Some(remote_uuid.clone()) == last_uuid {

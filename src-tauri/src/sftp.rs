@@ -122,15 +122,18 @@ fn connect_params(req: &SftpConnectRequest) -> SshConnectParams {
 pub async fn sftp_connect(
     req: SftpConnectRequest,
     sessions: State<'_, SftpSessions>,
+    proxy_state: State<'_, crate::proxy::ProxyState>,
 ) -> Result<SftpConnectResponse, String> {
     println!(
         "[sftp] connect requested host={} port={} user={}",
         req.host, req.port, req.username
     );
+    let proxy = (*proxy_state).clone();
     let params = connect_params(&req);
     let (session, home) = tauri::async_runtime::spawn_blocking(move || {
+        let proxy_for_connect = proxy.clone();
         ssh_client::block_on(async move {
-            let session = ssh_client::connect_async(params).await?;
+            let session = ssh_client::connect_async(params, proxy_for_connect).await?;
             let sftp = ssh_client::open_sftp_session(&session).await?;
             let home = sftp
                 .canonicalize(".")

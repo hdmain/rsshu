@@ -1,9 +1,11 @@
+mod proxy;
 mod sftp;
 mod ssh_client;
 mod sync;
 mod vault;
 
 use anyhow::{Context, Result};
+use proxy::{build_http_client, load_proxy_settings, ProxyState};
 use russh::ChannelMsg;
 use serde::{Deserialize, Serialize};
 use ssh_client::{SshConnectParams, SshHandle};
@@ -122,6 +124,7 @@ fn ssh_connect_params(req: &SshConnectRequest) -> SshConnectParams {
 
 fn connect_ssh<F: Fn(&str) + Send + Sync + 'static>(
     req: &SshConnectRequest,
+    proxy_state: &ProxyState,
     progress: F,
 ) -> Result<SshHandle> {
     println!(
@@ -135,6 +138,23 @@ fn connect_ssh<F: Fn(&str) + Send + Sync + 'static>(
         "TCP: opening socket to {}:{}…",
         req.host, req.port
     ));
+    if let Some(p) = {
+        let s = proxy_state.effective_settings();
+        if s.should_use_for(true) || s.lockdown_blocks(true) {
+            Some(s)
+        } else {
+            None
+        }
+    } {
+        if p.should_use_for(true) {
+            progress(&format!(
+                "Proxy: tunneling via {} {}:{} → {}:{}…",
+                p.proxy_type, p.host, p.port, req.host, req.port
+            ));
+        } else if p.lockdown_blocks(true) {
+            anyhow::bail!("Lockdown mode: direct SSH connections are blocked");
+        }
+    }
     progress("SSH: connecting and negotiating…");
     let params = ssh_connect_params(req);
 
@@ -142,14 +162,18 @@ fn connect_ssh<F: Fn(&str) + Send + Sync + 'static>(
     let key_auth = params.private_key.is_some();
     let handle = ssh_client::block_on({
         let progress = Arc::clone(&progress);
+        let proxy = proxy_state.clone();
         async move {
             let config = std::sync::Arc::new(russh::client::Config {
                 inactivity_timeout: Some(Duration::from_secs(300)),
                 ..Default::default()
             });
-            let mut handle = russh::client::connect(
+            let stream = proxy::open_connection(&proxy, &params.host, params.port, true)
+                .await
+                .context("Failed to open connection (proxy or direct)")?;
+            let mut handle = russh::client::connect_stream(
                 config,
-                (params.host.as_str(), params.port),
+                stream,
                 ssh_client::SshClientHandler,
             )
             .await
@@ -407,9 +431,10 @@ fn matching_update_asset(
         .map(|(_, asset)| asset.clone())
 }
 
-fn fetch_latest_release() -> Result<GithubRelease> {
+fn fetch_latest_release(proxy_state: &ProxyState) -> Result<GithubRelease> {
     let url = format!("https://api.github.com/repos/{UPDATE_REPO}/releases/latest");
-    reqwest::blocking::Client::new()
+    let res = build_http_client(proxy_state)
+        .map_err(|e| anyhow::anyhow!(e))?
         .get(url)
         .header(
             reqwest::header::USER_AGENT,
@@ -418,9 +443,10 @@ fn fetch_latest_release() -> Result<GithubRelease> {
         .send()
         .context("Failed to query GitHub Releases")?
         .error_for_status()
-        .context("GitHub Releases returned an error")?
-        .json::<GithubRelease>()
-        .context("Failed to parse GitHub release response")
+        .context("GitHub Releases returned an error")?;
+    let bytes = res.bytes().context("Failed to read GitHub release response")?;
+    proxy_state.record_http_bytes(bytes.len() as u64);
+    serde_json::from_slice(&bytes).context("Failed to parse GitHub release response")
 }
 
 fn build_update_check_response(release: GithubRelease) -> UpdateCheckResponse {
@@ -453,8 +479,8 @@ fn build_update_check_response(release: GithubRelease) -> UpdateCheckResponse {
     }
 }
 
-fn check_update_blocking() -> Result<(UpdateCheckResponse, Option<GithubReleaseAsset>)> {
-    let release = fetch_latest_release()?;
+fn check_update_blocking(proxy_state: &ProxyState) -> Result<(UpdateCheckResponse, Option<GithubReleaseAsset>)> {
+    let release = fetch_latest_release(proxy_state)?;
     let os = current_update_os();
     let arch = current_update_arch();
     let asset = matching_update_asset(&release, &os, &arch);
@@ -474,7 +500,11 @@ fn safe_asset_filename(name: &str) -> String {
         .collect()
 }
 
-fn download_update_asset(app: &AppHandle, asset: &GithubReleaseAsset) -> Result<std::path::PathBuf> {
+fn download_update_asset(
+    app: &AppHandle,
+    asset: &GithubReleaseAsset,
+    proxy_state: &ProxyState,
+) -> Result<std::path::PathBuf> {
     let dir = app
         .path()
         .app_cache_dir()
@@ -482,7 +512,8 @@ fn download_update_asset(app: &AppHandle, asset: &GithubReleaseAsset) -> Result<
         .join("updates");
     std::fs::create_dir_all(&dir).context("Failed to create update cache directory")?;
     let path = dir.join(safe_asset_filename(&asset.name));
-    let bytes = reqwest::blocking::Client::new()
+    let bytes = build_http_client(proxy_state)
+        .map_err(|e| anyhow::anyhow!(e))?
         .get(&asset.browser_download_url)
         .header(
             reqwest::header::USER_AGENT,
@@ -494,6 +525,7 @@ fn download_update_asset(app: &AppHandle, asset: &GithubReleaseAsset) -> Result<
         .context("Update installer download returned an error")?
         .bytes()
         .context("Failed to read update installer")?;
+    proxy_state.record_http_bytes(bytes.len() as u64);
     let mut file = std::fs::File::create(&path).context("Failed to create update installer file")?;
     file.write_all(&bytes)
         .context("Failed to write update installer file")?;
@@ -571,11 +603,15 @@ fn launch_update_installer(path: &std::path::Path) -> Result<String> {
 }
 
 #[tauri::command]
-async fn ssh_test_connection(req: SshConnectRequest) -> Result<String, String> {
+async fn ssh_test_connection(
+    req: SshConnectRequest,
+    proxy_state: State<'_, ProxyState>,
+) -> Result<String, String> {
     println!(
         "[ssh] test connection requested host={} port={} user={}",
         req.host, req.port, req.username
     );
+    let proxy = (*proxy_state).clone();
     let req_for_connect = SshConnectRequest {
         host: req.host.clone(),
         port: req.port,
@@ -584,7 +620,7 @@ async fn ssh_test_connection(req: SshConnectRequest) -> Result<String, String> {
         private_key: req.private_key.clone(),
         passphrase: req.passphrase.clone(),
     };
-    tauri::async_runtime::spawn_blocking(move || connect_ssh(&req_for_connect, |_| {}))
+    tauri::async_runtime::spawn_blocking(move || connect_ssh(&req_for_connect, &proxy, |_| {}))
         .await
         .map_err(|e| format!("Connection worker thread failed: {e}"))?
         .map(|_| format!("Connected to {}@{}:{}", req.username, req.host, req.port))
@@ -596,11 +632,13 @@ async fn ssh_start_shell(
     app: AppHandle,
     req: SshShellRequest,
     sessions: State<'_, ShellSessions>,
+    proxy_state: State<'_, ProxyState>,
 ) -> Result<SshShellStartResponse, String> {
     println!(
         "[ssh] start shell requested host={} port={} user={}",
         req.host, req.port, req.username
     );
+    let proxy = (*proxy_state).clone();
     let connect_req = SshConnectRequest {
         host: req.host.clone(),
         port: req.port,
@@ -612,7 +650,7 @@ async fn ssh_start_shell(
     let app_for_progress = app.clone();
     let (handle, channel) = tauri::async_runtime::spawn_blocking(move || {
         let app_connect = app_for_progress.clone();
-        let handle = connect_ssh(&connect_req, move |line| emit_progress(&app_connect, line))
+        let handle = connect_ssh(&connect_req, &proxy, move |line| emit_progress(&app_connect, line))
             .map_err(|e| e.to_string())?;
         emit_progress(&app_for_progress, "Shell: opening session channel…");
         ssh_client::block_on(async move {
@@ -784,9 +822,10 @@ async fn ssh_fetch_host_metrics(
 }
 
 #[tauri::command]
-async fn app_check_update() -> Result<UpdateCheckResponse, String> {
-    tauri::async_runtime::spawn_blocking(|| {
-        check_update_blocking()
+async fn app_check_update(proxy_state: State<'_, ProxyState>) -> Result<UpdateCheckResponse, String> {
+    let proxy = (*proxy_state).clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        check_update_blocking(&proxy)
             .map(|(response, _)| response)
             .map_err(|e| e.to_string())
     })
@@ -795,9 +834,13 @@ async fn app_check_update() -> Result<UpdateCheckResponse, String> {
 }
 
 #[tauri::command]
-async fn app_install_update(app: AppHandle) -> Result<UpdateInstallResponse, String> {
+async fn app_install_update(
+    app: AppHandle,
+    proxy_state: State<'_, ProxyState>,
+) -> Result<UpdateInstallResponse, String> {
+    let proxy = (*proxy_state).clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let (check, asset) = check_update_blocking().map_err(|e| e.to_string())?;
+        let (check, asset) = check_update_blocking(&proxy).map_err(|e| e.to_string())?;
         if !check.update_available {
             return Err(check.message);
         }
@@ -807,7 +850,7 @@ async fn app_install_update(app: AppHandle) -> Result<UpdateInstallResponse, Str
                 check.os, check.arch
             )
         })?;
-        let path = download_update_asset(&app, &asset).map_err(|e| e.to_string())?;
+        let path = download_update_asset(&app, &asset, &proxy).map_err(|e| e.to_string())?;
         let message = launch_update_installer(&path).map_err(|e| e.to_string())?;
         Ok(UpdateInstallResponse {
             installer_path: path.to_string_lossy().to_string(),
@@ -1043,6 +1086,7 @@ pub fn run() {
         .manage(SftpSessions::new())
         .manage(Vault::new())
         .manage(SyncState::new())
+        .manage(ProxyState::new())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -1081,8 +1125,17 @@ pub fn run() {
             sync::sync_pull,
             sync::sync_poll_updates,
             file_metadata,
+            proxy::proxy_get,
+            proxy::proxy_set_config,
+            proxy::proxy_upsert_server,
+            proxy::proxy_delete_server,
+            proxy::proxy_test,
         ])
         .setup(|app| {
+            let proxy_state = app.state::<ProxyState>();
+            if let Err(e) = load_proxy_settings(&app.handle(), &proxy_state) {
+                eprintln!("[proxy] failed to load settings: {e}");
+            }
             let app_handle = app.handle().clone();
             std::thread::spawn(move || loop {
                 std::thread::sleep(Duration::from_secs(30));

@@ -34,5 +34,8 @@ argon2 = "0.5"
 rand = "0.8"
 base64 = "0.22"
 zeroize = { version = "1", features = ["zeroize_derive"] }
-reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"] }
+reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls", "socks"] }
 uuid = { version = "1", features = ["v4"] }
+tokio-socks = "0.5"
+tokio-rustls = "0.26"
+webpki-roots = "0.26"
