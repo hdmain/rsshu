@@ -54,6 +54,12 @@ export type SyncPayload = {
   settings: SyncSettings;
 };
 
+/** Parsed remote gist content. `settings: null` means legacy hosts-only sync. */
+export type ParsedSyncPayload = {
+  hosts: unknown[];
+  settings: Partial<SyncSettings> | null;
+};
+
 export const DEFAULT_TERMINAL_KEYWORD_SETTINGS: TerminalKeywordSettings = {
   enabled: true,
   colors: {
@@ -131,6 +137,106 @@ function readConnectCounts(): Record<string, { ssh: number; sftp: number }> {
   }
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function parseProxyConfig(raw: unknown): SyncProxyConfig {
+  const config = isRecord(raw) ? raw : {};
+  return {
+    enabled: config.enabled === true,
+    activeServerId:
+      typeof config.activeServerId === "string"
+        ? config.activeServerId
+        : config.activeServerId === null
+          ? null
+          : null,
+    applySsh: config.applySsh !== false,
+    applyHttp: config.applyHttp !== false,
+    lockdown: config.lockdown === true,
+  };
+}
+
+function parseProxyType(raw: unknown): SyncProxyType {
+  if (raw === "socks4" || raw === "socks5" || raw === "http" || raw === "https") {
+    return raw;
+  }
+  return "socks5";
+}
+
+function parseProxyServers(raw: unknown): SyncProxyServer[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter(isRecord)
+    .map((server) => ({
+      id: typeof server.id === "string" ? server.id : "",
+      name: typeof server.name === "string" ? server.name : "",
+      type: parseProxyType(server.type),
+      host: typeof server.host === "string" ? server.host : "",
+      port: typeof server.port === "number" ? server.port : 0,
+      username: typeof server.username === "string" ? server.username : "",
+      password: typeof server.password === "string" ? server.password : "",
+    }))
+    .filter((server) => server.id.length > 0);
+}
+
+function extractPartialSettings(raw: unknown): Partial<SyncSettings> | null {
+  if (!isRecord(raw) || !("settings" in raw)) return null;
+  const settings = raw.settings;
+  if (!isRecord(settings)) return null;
+
+  const partial: Partial<SyncSettings> = {};
+
+  if ("sftpHideDotfiles" in settings) {
+    partial.sftpHideDotfiles = settings.sftpHideDotfiles === true;
+  }
+  if ("sftpOpenEditMode" in settings) {
+    partial.sftpOpenEditMode = settings.sftpOpenEditMode === "confirm" ? "confirm" : "auto";
+  }
+  if ("privacyRedactHosts" in settings) {
+    partial.privacyRedactHosts = settings.privacyRedactHosts === true;
+  }
+  if ("terminalHostInfoBar" in settings) {
+    partial.terminalHostInfoBar = settings.terminalHostInfoBar !== false;
+  }
+  if ("tcprawEnabled" in settings) {
+    partial.tcprawEnabled = settings.tcprawEnabled === true;
+  }
+  if ("autoInstallUpdates" in settings) {
+    partial.autoInstallUpdates = settings.autoInstallUpdates === true;
+  }
+  if ("quickNavKey" in settings && typeof settings.quickNavKey === "string") {
+    partial.quickNavKey = settings.quickNavKey;
+  }
+  if ("connectCounts" in settings && isRecord(settings.connectCounts)) {
+    partial.connectCounts = settings.connectCounts as Record<string, { ssh: number; sftp: number }>;
+  }
+  if ("terminalKeywordSettings" in settings && isRecord(settings.terminalKeywordSettings)) {
+    const keyword = settings.terminalKeywordSettings;
+    const colors = isRecord(keyword.colors) ? keyword.colors : {};
+    partial.terminalKeywordSettings = {
+      enabled: keyword.enabled !== false,
+      colors: {
+        ...DEFAULT_TERMINAL_KEYWORD_SETTINGS.colors,
+        ...(typeof colors.error === "string" ? { error: colors.error } : {}),
+        ...(typeof colors.warning === "string" ? { warning: colors.warning } : {}),
+        ...(typeof colors.ok === "string" ? { ok: colors.ok } : {}),
+        ...(typeof colors.info === "string" ? { info: colors.info } : {}),
+        ...(typeof colors.debug === "string" ? { debug: colors.debug } : {}),
+        ...(typeof colors.network === "string" ? { network: colors.network } : {}),
+      },
+    };
+  }
+  if ("proxy" in settings && isRecord(settings.proxy)) {
+    partial.proxy = {
+      servers: parseProxyServers(settings.proxy.servers),
+      config: parseProxyConfig(settings.proxy.config),
+    };
+  }
+
+  return Object.keys(partial).length > 0 ? partial : null;
+}
+
 export function buildSyncPayload(input: {
   hosts: unknown[];
   sftpHideDotfiles: boolean;
@@ -170,43 +276,18 @@ export function buildSyncPayloadJson(input: Parameters<typeof buildSyncPayload>[
   return JSON.stringify(buildSyncPayload(input));
 }
 
-export function parseSyncPayload(raw: string): SyncPayload {
+export function parseSyncPayload(raw: string): ParsedSyncPayload {
   const parsed: unknown = JSON.parse(raw || "{}");
   if (Array.isArray(parsed)) {
+    return { hosts: parsed, settings: null };
+  }
+  if (isRecord(parsed) && "hosts" in parsed) {
     return {
-      ...EMPTY_SYNC_PAYLOAD,
-      hosts: parsed,
+      hosts: Array.isArray(parsed.hosts) ? parsed.hosts : [],
+      settings: extractPartialSettings(parsed),
     };
   }
-  if (typeof parsed === "object" && parsed !== null && "hosts" in parsed) {
-    const payload = parsed as Partial<SyncPayload>;
-    const settings = payload.settings ?? EMPTY_SYNC_PAYLOAD.settings;
-    return {
-      version: 1,
-      hosts: Array.isArray(payload.hosts) ? payload.hosts : [],
-      settings: {
-        ...EMPTY_SYNC_PAYLOAD.settings,
-        ...settings,
-        terminalKeywordSettings: {
-          ...DEFAULT_TERMINAL_KEYWORD_SETTINGS,
-          ...(settings.terminalKeywordSettings ?? {}),
-          colors: {
-            ...DEFAULT_TERMINAL_KEYWORD_SETTINGS.colors,
-            ...(settings.terminalKeywordSettings?.colors ?? {}),
-          },
-        },
-        proxy: {
-          servers: settings.proxy?.servers ?? [],
-          config: {
-            ...EMPTY_SYNC_PAYLOAD.settings.proxy.config,
-            ...(settings.proxy?.config ?? {}),
-          },
-        },
-        connectCounts: settings.connectCounts ?? {},
-      },
-    };
-  }
-  return EMPTY_SYNC_PAYLOAD;
+  return { hosts: [], settings: null };
 }
 
 export function persistSyncSettings(settings: SyncSettings): void {
@@ -238,6 +319,58 @@ export function persistSyncSettings(settings: SyncSettings): void {
       SYNC_SETTINGS_KEYS.terminalKeywordSettings,
       JSON.stringify(settings.terminalKeywordSettings),
     );
+  } catch {
+    // ignore
+  }
+}
+
+export function persistPartialSyncSettings(settings: Partial<SyncSettings>): void {
+  try {
+    if (settings.sftpHideDotfiles !== undefined) {
+      localStorage.setItem(
+        SYNC_SETTINGS_KEYS.sftpHideDotfiles,
+        settings.sftpHideDotfiles ? "1" : "0",
+      );
+    }
+    if (settings.sftpOpenEditMode !== undefined) {
+      localStorage.setItem(SYNC_SETTINGS_KEYS.sftpOpenEditMode, settings.sftpOpenEditMode);
+    }
+    if (settings.privacyRedactHosts !== undefined) {
+      localStorage.setItem(
+        SYNC_SETTINGS_KEYS.privacyRedactHosts,
+        settings.privacyRedactHosts ? "1" : "0",
+      );
+    }
+    if (settings.terminalHostInfoBar !== undefined) {
+      localStorage.setItem(
+        SYNC_SETTINGS_KEYS.terminalHostInfoBar,
+        settings.terminalHostInfoBar ? "1" : "0",
+      );
+    }
+    if (settings.tcprawEnabled !== undefined) {
+      localStorage.setItem(SYNC_SETTINGS_KEYS.tcprawEnabled, settings.tcprawEnabled ? "1" : "0");
+    }
+    if (settings.autoInstallUpdates !== undefined) {
+      localStorage.setItem(
+        SYNC_SETTINGS_KEYS.autoInstallUpdates,
+        settings.autoInstallUpdates ? "1" : "0",
+      );
+    }
+    if (settings.quickNavKey !== undefined) {
+      localStorage.setItem(SYNC_SETTINGS_KEYS.quickNavKey, settings.quickNavKey);
+    }
+    if (settings.connectCounts !== undefined) {
+      localStorage.setItem(
+        SYNC_SETTINGS_KEYS.connectCounts,
+        JSON.stringify(settings.connectCounts),
+      );
+    }
+    if (settings.terminalKeywordSettings !== undefined) {
+      localStorage.setItem(
+        SYNC_SETTINGS_KEYS.terminalKeywordSettings,
+        JSON.stringify(settings.terminalKeywordSettings),
+      );
+    }
   } catch {
     // ignore
   }

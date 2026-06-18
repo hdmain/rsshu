@@ -53,9 +53,9 @@ import {
   DEFAULT_TERMINAL_KEYWORD_SETTINGS,
   loadPersistedSyncSettings,
   parseSyncPayload,
-  persistSyncSettings,
+  persistPartialSyncSettings,
   SYNC_SETTINGS_KEYS,
-  type SyncPayload,
+  type ParsedSyncPayload,
 } from "@/lib/sync-payload";
 
 type Host = {
@@ -393,6 +393,7 @@ function App() {
   const [updateInfo, setUpdateInfo] = useState("");
   const [proxyStore, setProxyStore] = useState<ProxyStore>(defaultProxyStore);
   const [proxyConfigDraft, setProxyConfigDraft] = useState<ProxyConfig>(defaultProxyConfig);
+  const [proxyReady, setProxyReady] = useState(false);
   const [proxyBusy, setProxyBusy] = useState(false);
   const [proxyInfo, setProxyInfo] = useState("");
   const [proxyError, setProxyError] = useState("");
@@ -416,6 +417,7 @@ function App() {
   const hostMetricsInFlightRef = useRef(false);
   const hostMetricsFirstLoadRef = useRef(true);
   const autoUpdateCheckedRef = useRef(false);
+  const needsMigrationPushRef = useRef(false);
 
   useEffect(() => {
     activeTabIdRef.current = activeTabId;
@@ -483,6 +485,9 @@ function App() {
       })
       .catch(() => {
         // ignore — backend may not be ready yet
+      })
+      .finally(() => {
+        setProxyReady(true);
       });
   }, []);
 
@@ -518,28 +523,37 @@ function App() {
     }
   }, []);
 
-  const applySyncPayload = useCallback(async (payload: SyncPayload) => {
-    setHosts(payload.hosts as Host[]);
-    const settings = payload.settings;
-    setSftpHideDotfiles(settings.sftpHideDotfiles);
-    setSftpOpenEditMode(settings.sftpOpenEditMode);
-    setPrivacyRedactHosts(settings.privacyRedactHosts);
-    setShowTerminalHostInfoBar(settings.terminalHostInfoBar);
-    setTcprawEnabled(settings.tcprawEnabled);
-    setAutoInstallUpdates(settings.autoInstallUpdates);
-    setQuickNavKey(settings.quickNavKey);
-    setConnectCounts(settings.connectCounts);
-    setTerminalKeywordSettings(settings.terminalKeywordSettings);
-    persistSyncSettings(settings);
-    try {
-      const store = await invoke<ProxyStore>("proxy_import_sync", {
-        servers: settings.proxy.servers,
-        config: settings.proxy.config,
-      });
-      setProxyStore(store);
-      setProxyConfigDraft(store.config);
-    } catch (err) {
-      console.error("[sync] proxy import failed", err);
+  const applySyncPayload = useCallback(async (parsed: ParsedSyncPayload) => {
+    setHosts(parsed.hosts as Host[]);
+    const settings = parsed.settings;
+    if (!settings) return;
+
+    if (settings.sftpHideDotfiles !== undefined) setSftpHideDotfiles(settings.sftpHideDotfiles);
+    if (settings.sftpOpenEditMode !== undefined) setSftpOpenEditMode(settings.sftpOpenEditMode);
+    if (settings.privacyRedactHosts !== undefined) setPrivacyRedactHosts(settings.privacyRedactHosts);
+    if (settings.terminalHostInfoBar !== undefined) {
+      setShowTerminalHostInfoBar(settings.terminalHostInfoBar);
+    }
+    if (settings.tcprawEnabled !== undefined) setTcprawEnabled(settings.tcprawEnabled);
+    if (settings.autoInstallUpdates !== undefined) setAutoInstallUpdates(settings.autoInstallUpdates);
+    if (settings.quickNavKey !== undefined) setQuickNavKey(settings.quickNavKey);
+    if (settings.connectCounts !== undefined) setConnectCounts(settings.connectCounts);
+    if (settings.terminalKeywordSettings !== undefined) {
+      setTerminalKeywordSettings(settings.terminalKeywordSettings);
+    }
+    persistPartialSyncSettings(settings);
+
+    if (settings.proxy !== undefined) {
+      try {
+        const store = await invoke<ProxyStore>("proxy_import_sync", {
+          servers: settings.proxy.servers,
+          config: settings.proxy.config,
+        });
+        setProxyStore(store);
+        setProxyConfigDraft(store.config);
+      } catch (err) {
+        console.error("[sync] proxy import failed", err);
+      }
     }
   }, []);
 
@@ -630,18 +644,18 @@ function App() {
   }, [hosts, vaultStatus]);
 
   useEffect(() => {
-    if (vaultStatus !== "unlocked" || !syncEnabled || !syncReadyForPush) return;
+    if (vaultStatus !== "unlocked" || !syncEnabled || !syncReadyForPush || !proxyReady) return;
     const handle = window.setTimeout(() => {
       void invoke("sync_push", { payloadJson: syncPayloadJson }).catch((err) => {
         console.error("[sync] push failed", err);
       });
     }, 300);
     return () => window.clearTimeout(handle);
-  }, [syncPayloadJson, vaultStatus, syncEnabled, syncReadyForPush]);
+  }, [syncPayloadJson, vaultStatus, syncEnabled, syncReadyForPush, proxyReady]);
 
   useEffect(() => {
-    if (vaultStatus !== "unlocked" || !syncEnabled) {
-      setSyncReadyForPush(false);
+    if (vaultStatus !== "unlocked" || !syncEnabled || !proxyReady) {
+      if (!syncEnabled) setSyncReadyForPush(false);
       return;
     }
     let cancelled = false;
@@ -649,8 +663,16 @@ function App() {
       try {
         const json = await invoke<string>("sync_pull");
         if (cancelled) return;
-        await applySyncPayload(parseSyncPayload(json));
-        setSyncInfo("Startup sync completed (pulled from cloud).");
+        const parsed = parseSyncPayload(json);
+        await applySyncPayload(parsed);
+        setSyncInfo(
+          parsed.settings
+            ? "Startup sync completed (pulled from cloud)."
+            : "Startup sync completed (hosts only — push from the main machine to upload settings).",
+        );
+        if (!parsed.settings) {
+          needsMigrationPushRef.current = true;
+        }
         setSyncReadyForPush(true);
       } catch (err) {
         if (cancelled) return;
@@ -661,7 +683,19 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [vaultStatus, syncEnabled, applySyncPayload]);
+  }, [vaultStatus, syncEnabled, proxyReady, applySyncPayload]);
+
+  useEffect(() => {
+    if (!syncReadyForPush || !proxyReady || !needsMigrationPushRef.current) return;
+    needsMigrationPushRef.current = false;
+    void invoke("sync_push", { payloadJson: syncPayloadJson, force: true })
+      .then(() => {
+        setSyncInfo("Migrated cloud sync to include settings and proxy.");
+      })
+      .catch((err) => {
+        console.error("[sync] migration push failed", err);
+      });
+  }, [syncReadyForPush, proxyReady, syncPayloadJson]);
 
   useEffect(() => {
     if (vaultStatus !== "unlocked" || !syncEnabled || !syncReadyForPush) return;
@@ -804,8 +838,27 @@ function App() {
     setSyncInfo("");
     try {
       const json = await invoke<string>("sync_pull");
-      await applySyncPayload(parseSyncPayload(json));
-      setSyncInfo("Pulled latest data from GitHub Gist.");
+      const parsed = parseSyncPayload(json);
+      await applySyncPayload(parsed);
+      setSyncInfo(
+        parsed.settings
+          ? "Pulled latest data from GitHub Gist."
+          : "Pulled hosts only. Use Push Now on the machine that has your proxy and settings.",
+      );
+    } catch (err) {
+      setSyncError(String(err));
+    } finally {
+      setSyncBusy(false);
+    }
+  }
+
+  async function pushToCloud() {
+    setSyncBusy(true);
+    setSyncError("");
+    setSyncInfo("");
+    try {
+      await invoke("sync_push", { payloadJson: syncPayloadJson, force: true });
+      setSyncInfo("Pushed latest data to GitHub Gist.");
     } catch (err) {
       setSyncError(String(err));
     } finally {
@@ -2471,6 +2524,13 @@ function App() {
                         <Button disabled={syncBusy || !syncEnabled} variant="outline" onClick={() => void pullFromCloud()}>
                           Pull Now
                         </Button>
+                        <Button
+                          disabled={syncBusy || !syncEnabled || !proxyReady}
+                          variant="outline"
+                          onClick={() => void pushToCloud()}
+                        >
+                          Push Now
+                        </Button>
                         <Button disabled={syncBusy || !syncEnabled} variant="outline" onClick={() => void disableSync()}>
                           Disable
                         </Button>
@@ -2480,6 +2540,8 @@ function App() {
                       <p className="app-text-muted text-xs">
                         Once sync is on, changes to hosts and settings (except theme) are automatically written
                         to the Gist. On another machine, use the same Gist ID and Sync key, then click Pull Now.
+                        If you used the old hosts-only sync, click Push Now on the machine that has proxy and
+                        settings configured, then Pull Now on the other machine.
                       </p>
                     </CardContent>
                   </Card>

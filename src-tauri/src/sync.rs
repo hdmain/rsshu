@@ -364,7 +364,9 @@ pub fn sync_push(
     vault_state: State<'_, Vault>,
     proxy_state: State<'_, crate::proxy::ProxyState>,
     payload_json: String,
+    force: Option<bool>,
 ) -> Result<(), String> {
+    let force = force.unwrap_or(false);
     let (cfg, should_skip) = {
         let mut inner = sync.inner.lock().map_err(|_| "Sync lock poisoned".to_string())?;
         if inner.config.is_none() {
@@ -376,7 +378,12 @@ pub fn sync_push(
         if !cfg.enabled {
             return Ok(());
         }
-        let skip = inner.last_payload.as_ref().map(|v| v == &payload_json).unwrap_or(false);
+        let skip = !force
+            && inner
+                .last_payload
+                .as_ref()
+                .map(|v| v == &payload_json)
+                .unwrap_or(false);
         (cfg, skip)
     };
     if should_skip {
