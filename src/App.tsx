@@ -30,6 +30,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { Dropdown } from "@/components/ui/dropdown";
 import { Separator } from "@/components/ui/separator";
 import {
   clearTerminalSessionCache,
@@ -1910,23 +1911,24 @@ function App() {
                         <p className="app-text-muted text-xs font-medium uppercase tracking-wide">
                           Proxy server
                         </p>
-                        <select
-                          value={proxyConfigDraft.activeServerId ?? ""}
-                          onChange={(e) =>
+                        <Dropdown
+                          value={proxyConfigDraft.activeServerId}
+                          onValueChange={(id) =>
                             setProxyConfigDraft((prev) => ({
                               ...prev,
-                              activeServerId: e.target.value || null,
+                              activeServerId: id,
                             }))
                           }
-                          className="app-card app-chrome-border app-text-strong h-9 w-full rounded-md border px-2 text-sm"
-                        >
-                          <option value="">— select server —</option>
-                          {proxyStore.servers.map((server) => (
-                            <option key={server.id} value={server.id}>
-                              {server.name} ({server.type.toUpperCase()} {server.host}:{server.port})
-                            </option>
-                          ))}
-                        </select>
+                          allowEmpty
+                          emptyLabel="— select server —"
+                          placeholder="— select server —"
+                          disabled={proxyStore.servers.length === 0}
+                          options={proxyStore.servers.map((server) => ({
+                            value: server.id,
+                            label: server.name,
+                            description: `${server.type.toUpperCase()} · ${server.host}:${server.port}`,
+                          }))}
+                        />
                       </div>
 
                       <div className="app-card app-soft grid gap-2 rounded-md px-3 py-3 sm:grid-cols-2">
@@ -2573,21 +2575,21 @@ function App() {
                 <div className="grid gap-3 sm:grid-cols-2">
                   <div className="space-y-1.5">
                     <p className="app-text-muted text-xs font-medium uppercase tracking-wide">Type</p>
-                    <select
+                    <Dropdown
                       value={proxyServerDraft.type}
-                      onChange={(e) =>
+                      onValueChange={(type) =>
                         setProxyServerDraft((prev) => ({
                           ...prev,
-                          type: e.target.value as ProxyType,
+                          type: (type ?? "socks5") as ProxyType,
                         }))
                       }
-                      className="app-card app-chrome-border app-text-strong h-9 w-full rounded-md border px-2 text-sm"
-                    >
-                      <option value="socks5">SOCKS5</option>
-                      <option value="socks4">SOCKS4</option>
-                      <option value="http">HTTP</option>
-                      <option value="https">HTTPS</option>
-                    </select>
+                      options={[
+                        { value: "socks5", label: "SOCKS5" },
+                        { value: "socks4", label: "SOCKS4" },
+                        { value: "http", label: "HTTP" },
+                        { value: "https", label: "HTTPS" },
+                      ]}
+                    />
                   </div>
                   <div className="space-y-1.5">
                     <p className="app-text-muted text-xs font-medium uppercase tracking-wide">Port</p>

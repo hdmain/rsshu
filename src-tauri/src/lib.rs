@@ -20,6 +20,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use std::thread;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
+use tauri::webview::PageLoadEvent;
 
 use sftp::SftpSessions;
 use sync::SyncState;
@@ -1079,6 +1080,30 @@ fn ssh_close_shell(session_id: String, sessions: State<'_, ShellSessions>) -> Re
         .map_err(|_| "Failed to close shell".to_string())
 }
 
+static SPLASH_SHOWN: AtomicBool = AtomicBool::new(false);
+
+fn show_splash_window(app: &AppHandle) -> Result<(), String> {
+    if SPLASH_SHOWN.swap(true, Ordering::SeqCst) {
+        return Ok(());
+    }
+    let splash = app
+        .get_webview_window("splashscreen")
+        .ok_or("splashscreen window not found")?;
+    splash.show().map_err(|e| e.to_string())?;
+    splash.set_focus().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn show_splashscreen(app: AppHandle) -> Result<(), String> {
+    show_splash_window(&app)
+}
+
+#[tauri::command]
+fn splash_is_shown() -> bool {
+    SPLASH_SHOWN.load(Ordering::SeqCst)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
@@ -1090,7 +1115,14 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .on_page_load(|webview, payload| {
+            if payload.event() == PageLoadEvent::Finished && webview.label() == "splashscreen" {
+                let _ = show_splash_window(webview.app_handle());
+            }
+        })
         .invoke_handler(tauri::generate_handler![
+            show_splashscreen,
+            splash_is_shown,
             ssh_test_connection,
             ssh_start_shell,
             ssh_send_input,
