@@ -48,6 +48,15 @@ import {
   hostPasswordDisplay,
   redactConnectionLogLine,
 } from "@/lib/privacy-display";
+import {
+  buildSyncPayloadJson,
+  DEFAULT_TERMINAL_KEYWORD_SETTINGS,
+  loadPersistedSyncSettings,
+  parseSyncPayload,
+  persistSyncSettings,
+  SYNC_SETTINGS_KEYS,
+  type SyncPayload,
+} from "@/lib/sync-payload";
 
 type Host = {
   id: string;
@@ -349,17 +358,9 @@ function App() {
   const [vaultError, setVaultError] = useState("");
   const skipNextSaveRef = useRef(false);
   const reachabilityProbeGenRef = useRef(0);
-  const [terminalKeywordSettings, setTerminalKeywordSettings] = useState<TerminalKeywordSettings>({
-    enabled: true,
-    colors: {
-      error: "#ff5f66",
-      warning: "#ffd84d",
-      ok: "#7ce38b",
-      info: "#3da5ff",
-      debug: "#8f8cff",
-      network: "#e061b3",
-    },
-  });
+  const [terminalKeywordSettings, setTerminalKeywordSettings] = useState<TerminalKeywordSettings>(
+    () => loadPersistedSyncSettings().terminalKeywordSettings ?? DEFAULT_TERMINAL_KEYWORD_SETTINGS,
+  );
   const [syncEnabled, setSyncEnabled] = useState(false);
   const [syncBusy, setSyncBusy] = useState(false);
   const [syncError, setSyncError] = useState("");
@@ -368,14 +369,15 @@ function App() {
   const [syncGistId, setSyncGistId] = useState("");
   const [syncKey, setSyncKey] = useState("");
   const [syncReadyForPush, setSyncReadyForPush] = useState(false);
-  const SFTP_HIDE_DOTFILES_KEY = "rsshu.settings.sftpHideDotfiles";
-  const SFTP_OPEN_EDIT_KEY = "rsshu.settings.sftpOpenEditMode";
-  const PRIVACY_REDACT_HOSTS_KEY = "rsshu.settings.privacyRedactHosts";
-  const TERMINAL_HOST_INFO_BAR_KEY = "rsshu.settings.terminalHostInfoBar";
-  const TCPRAW_ENABLED_KEY = "rsshu.settings.tcprawEnabled";
-  const AUTO_INSTALL_UPDATES_KEY = "rsshu.settings.autoInstallUpdates";
-  const QUICK_NAV_KEY_STORAGE = "rsshu.settings.quickNavKey";
-  const CONNECT_COUNTS_KEY = "rsshu.connectCounts";
+  const SFTP_HIDE_DOTFILES_KEY = SYNC_SETTINGS_KEYS.sftpHideDotfiles;
+  const SFTP_OPEN_EDIT_KEY = SYNC_SETTINGS_KEYS.sftpOpenEditMode;
+  const PRIVACY_REDACT_HOSTS_KEY = SYNC_SETTINGS_KEYS.privacyRedactHosts;
+  const TERMINAL_HOST_INFO_BAR_KEY = SYNC_SETTINGS_KEYS.terminalHostInfoBar;
+  const TCPRAW_ENABLED_KEY = SYNC_SETTINGS_KEYS.tcprawEnabled;
+  const AUTO_INSTALL_UPDATES_KEY = SYNC_SETTINGS_KEYS.autoInstallUpdates;
+  const QUICK_NAV_KEY_STORAGE = SYNC_SETTINGS_KEYS.quickNavKey;
+  const CONNECT_COUNTS_KEY = SYNC_SETTINGS_KEYS.connectCounts;
+  const TERMINAL_KEYWORD_SETTINGS_KEY = SYNC_SETTINGS_KEYS.terminalKeywordSettings;
   /** Remote metrics script sleeps 0.5s for CPU/network delta; poll slightly above that. */
   const HOST_METRICS_POLL_MS = 2000;
   const [sftpHideDotfiles, setSftpHideDotfiles] = useState(false);
@@ -516,6 +518,71 @@ function App() {
     }
   }, []);
 
+  const applySyncPayload = useCallback(async (payload: SyncPayload) => {
+    setHosts(payload.hosts as Host[]);
+    const settings = payload.settings;
+    setSftpHideDotfiles(settings.sftpHideDotfiles);
+    setSftpOpenEditMode(settings.sftpOpenEditMode);
+    setPrivacyRedactHosts(settings.privacyRedactHosts);
+    setShowTerminalHostInfoBar(settings.terminalHostInfoBar);
+    setTcprawEnabled(settings.tcprawEnabled);
+    setAutoInstallUpdates(settings.autoInstallUpdates);
+    setQuickNavKey(settings.quickNavKey);
+    setConnectCounts(settings.connectCounts);
+    setTerminalKeywordSettings(settings.terminalKeywordSettings);
+    persistSyncSettings(settings);
+    try {
+      const store = await invoke<ProxyStore>("proxy_import_sync", {
+        servers: settings.proxy.servers,
+        config: settings.proxy.config,
+      });
+      setProxyStore(store);
+      setProxyConfigDraft(store.config);
+    } catch (err) {
+      console.error("[sync] proxy import failed", err);
+    }
+  }, []);
+
+  const syncPayloadJson = useMemo(
+    () =>
+      buildSyncPayloadJson({
+        hosts,
+        sftpHideDotfiles,
+        sftpOpenEditMode,
+        privacyRedactHosts,
+        terminalHostInfoBar: showTerminalHostInfoBar,
+        tcprawEnabled,
+        autoInstallUpdates,
+        quickNavKey,
+        connectCounts,
+        terminalKeywordSettings,
+        proxyServers: proxyStore.servers,
+        proxyConfig: proxyStore.config,
+      }),
+    [
+      hosts,
+      sftpHideDotfiles,
+      sftpOpenEditMode,
+      privacyRedactHosts,
+      showTerminalHostInfoBar,
+      tcprawEnabled,
+      autoInstallUpdates,
+      quickNavKey,
+      connectCounts,
+      terminalKeywordSettings,
+      proxyStore.servers,
+      proxyStore.config,
+    ],
+  );
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(TERMINAL_KEYWORD_SETTINGS_KEY, JSON.stringify(terminalKeywordSettings));
+    } catch {
+      // ignore
+    }
+  }, [terminalKeywordSettings]);
+
   useEffect(() => {
     (async () => {
       try {
@@ -565,12 +632,12 @@ function App() {
   useEffect(() => {
     if (vaultStatus !== "unlocked" || !syncEnabled || !syncReadyForPush) return;
     const handle = window.setTimeout(() => {
-      void invoke("sync_push", { hostsJson: JSON.stringify(hosts) }).catch((err) => {
+      void invoke("sync_push", { payloadJson: syncPayloadJson }).catch((err) => {
         console.error("[sync] push failed", err);
       });
     }, 300);
     return () => window.clearTimeout(handle);
-  }, [hosts, vaultStatus, syncEnabled, syncReadyForPush]);
+  }, [syncPayloadJson, vaultStatus, syncEnabled, syncReadyForPush]);
 
   useEffect(() => {
     if (vaultStatus !== "unlocked" || !syncEnabled) {
@@ -582,11 +649,8 @@ function App() {
       try {
         const json = await invoke<string>("sync_pull");
         if (cancelled) return;
-        const parsed = JSON.parse(json || "[]");
-        if (Array.isArray(parsed)) {
-          setHosts(parsed as Host[]);
-          setSyncInfo("Startup sync completed (pulled from cloud).");
-        }
+        await applySyncPayload(parseSyncPayload(json));
+        setSyncInfo("Startup sync completed (pulled from cloud).");
         setSyncReadyForPush(true);
       } catch (err) {
         if (cancelled) return;
@@ -597,7 +661,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [vaultStatus, syncEnabled]);
+  }, [vaultStatus, syncEnabled, applySyncPayload]);
 
   useEffect(() => {
     if (vaultStatus !== "unlocked" || !syncEnabled || !syncReadyForPush) return;
@@ -606,18 +670,15 @@ function App() {
         try {
           const poll = await invoke<SyncPollResponse>("sync_poll_updates");
           if (!poll.has_update || !poll.payload) return;
-          const parsed = JSON.parse(poll.payload || "[]");
-          if (Array.isArray(parsed)) {
-            setHosts(parsed as Host[]);
-            setSyncInfo("Cloud update detected and imported.");
-          }
+          await applySyncPayload(parseSyncPayload(poll.payload));
+          setSyncInfo("Cloud update detected and imported.");
         } catch (err) {
           console.error("[sync] poll failed", err);
         }
       })();
     }, 60_000);
     return () => window.clearInterval(interval);
-  }, [vaultStatus, syncEnabled, syncReadyForPush]);
+  }, [vaultStatus, syncEnabled, syncReadyForPush, applySyncPayload]);
 
   async function handleVaultInit(password: string) {
     setVaultBusy(true);
@@ -743,10 +804,7 @@ function App() {
     setSyncInfo("");
     try {
       const json = await invoke<string>("sync_pull");
-      const parsed = JSON.parse(json || "[]");
-      if (Array.isArray(parsed)) {
-        setHosts(parsed as Host[]);
-      }
+      await applySyncPayload(parseSyncPayload(json));
       setSyncInfo("Pulled latest data from GitHub Gist.");
     } catch (err) {
       setSyncError(String(err));
@@ -2385,7 +2443,8 @@ function App() {
                     <CardHeader>
                       <CardTitle className="app-text-strong">Cloud Sync (GitHub Gist)</CardTitle>
                       <CardDescription>
-                        Auto-sync encrypted hosts data. Note format: random UUID + AES-256 encrypted payload.
+                        Auto-sync encrypted hosts and app settings across devices. Theme stays local on each
+                        machine. Note format: random UUID + AES-256 encrypted payload.
                       </CardDescription>
                     </CardHeader>
                     <CardContent className="space-y-3">
@@ -2419,8 +2478,8 @@ function App() {
                       {syncInfo ? <p className="text-xs text-emerald-300">{syncInfo}</p> : null}
                       {syncError ? <p className="text-xs text-destructive">{syncError}</p> : null}
                       <p className="app-text-muted text-xs">
-                        Once sync is on, any change to your hosts is automatically written to the Gist. On
-                        another machine, use the same Gist ID and Sync key, then click Pull Now.
+                        Once sync is on, changes to hosts and settings (except theme) are automatically written
+                        to the Gist. On another machine, use the same Gist ID and Sync key, then click Pull Now.
                       </p>
                     </CardContent>
                   </Card>

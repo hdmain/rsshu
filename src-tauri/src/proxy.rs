@@ -902,6 +902,21 @@ pub fn proxy_delete_server(
 }
 
 #[tauri::command]
+pub fn proxy_import_sync(
+    app: AppHandle,
+    state: State<'_, ProxyState>,
+    servers: Vec<ProxyServer>,
+    config: ProxyConfig,
+) -> Result<ProxyStore, String> {
+    let mut store = state.get_store();
+    store.servers = servers;
+    store.config = config;
+    state.set_store(store.clone())?;
+    save_proxy_store(&app, &store)?;
+    Ok(store)
+}
+
+#[tauri::command]
 pub async fn proxy_test(
     state: State<'_, ProxyState>,
     server_id: Option<String>,

@@ -1129,6 +1129,7 @@ pub fn run() {
             proxy::proxy_set_config,
             proxy::proxy_upsert_server,
             proxy::proxy_delete_server,
+            proxy::proxy_import_sync,
             proxy::proxy_test,
         ])
         .setup(|app| {

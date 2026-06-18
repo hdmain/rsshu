@@ -309,7 +309,7 @@ pub fn sync_enable(
     let gist_id = if let Some(g) = req.gist_id.as_ref().filter(|v| !v.trim().is_empty()) {
         g.to_string()
     } else {
-        let (_, note) = make_note("[]", &key)?;
+        let (_, note) = make_note(r#"{"version":1,"hosts":[],"settings":{}}"#, &key)?;
         create_gist(&req.github_token, &note, &proxy)?
     };
     let cfg = SyncConfig {
@@ -363,7 +363,7 @@ pub fn sync_push(
     sync: State<'_, SyncState>,
     vault_state: State<'_, Vault>,
     proxy_state: State<'_, crate::proxy::ProxyState>,
-    hosts_json: String,
+    payload_json: String,
 ) -> Result<(), String> {
     let (cfg, should_skip) = {
         let mut inner = sync.inner.lock().map_err(|_| "Sync lock poisoned".to_string())?;
@@ -376,7 +376,7 @@ pub fn sync_push(
         if !cfg.enabled {
             return Ok(());
         }
-        let skip = inner.last_payload.as_ref().map(|v| v == &hosts_json).unwrap_or(false);
+        let skip = inner.last_payload.as_ref().map(|v| v == &payload_json).unwrap_or(false);
         (cfg, skip)
     };
     if should_skip {
@@ -384,11 +384,11 @@ pub fn sync_push(
     }
     let secrets = resolve_sync_secrets(&app, &vault_state, &cfg)?;
     let key = decode_key(&secrets.key_b64)?;
-    let (uuid, note) = make_note(&hosts_json, &key)?;
+    let (uuid, note) = make_note(&payload_json, &key)?;
     let proxy = (*proxy_state).clone();
     update_gist(&secrets.github_token, &cfg.gist_id, &note, &proxy)?;
     let mut inner = sync.inner.lock().map_err(|_| "Sync lock poisoned".to_string())?;
-    inner.last_payload = Some(hosts_json);
+    inner.last_payload = Some(payload_json);
     inner.last_uuid = Some(uuid);
     Ok(())
 }
