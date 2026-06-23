@@ -1116,8 +1116,17 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .on_page_load(|webview, payload| {
-            if payload.event() == PageLoadEvent::Finished && webview.label() == "splashscreen" {
-                let _ = show_splash_window(webview.app_handle());
+            if payload.event() != PageLoadEvent::Finished {
+                return;
+            }
+            match webview.label() {
+                "splashscreen" => {
+                    let _ = show_splash_window(webview.app_handle());
+                }
+                "main" => {
+                    let _ = webview.show();
+                }
+                _ => {}
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -1178,6 +1187,7 @@ pub fn run() {
                 let sftp_reaped = app_handle
                     .state::<SftpSessions>()
                     .reap_idle_sessions(IDLE_SESSION_MAX_MS);
+                app_handle.state::<SftpSessions>().send_keepalives();
                 if shell_reaped > 0 || sftp_reaped > 0 {
                     println!(
                         "[cleanup] reaped idle sessions shell={} sftp={}",

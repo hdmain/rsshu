@@ -98,6 +98,24 @@ impl SftpSessions {
             let _ = ssh_client::disconnect_session(state.session, reason);
         }
     }
+
+    pub fn send_keepalives(&self) {
+        let sessions: Vec<Arc<Mutex<SshHandle>>> = if let Ok(guard) = self.sessions.lock() {
+            guard.values().map(|s| Arc::clone(&s.session)).collect()
+        } else {
+            return;
+        };
+        for session in sessions {
+            let session = Arc::clone(&session);
+            std::thread::spawn(move || {
+                ssh_client::block_on(async move {
+                    if let Ok(handle) = session.try_lock() {
+                        let _ = handle.send_keepalive(false).await;
+                    }
+                });
+            });
+        }
+    }
 }
 
 fn now_ms() -> u64 {

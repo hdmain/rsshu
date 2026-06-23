@@ -37,7 +37,7 @@
         "alwaysOnTop": true,
         "resizable": false,
         "skipTaskbar": true,
-        "visible": false,
+        "visible": true,
         "backgroundColor": "#050912"
       }
     ],

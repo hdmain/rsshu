@@ -1,22 +1,22 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { getTerminalTheme } from "@/lib/themes";
 import { useTheme } from "@/lib/use-theme";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { readText } from "@tauri-apps/plugin-clipboard-manager";
 import { setTerminalClipboardBridge } from "@/lib/terminal-clipboard-bridge";
+import { loadTerminalFonts, TERMINAL_FONT_FAMILY } from "@/lib/terminal-fonts";
+import {
+  getTerminalSessionBuffer,
+  subscribeTerminalSessionOutput,
+} from "@/lib/shell-session-poller";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { ImageAddon, IImageAddonOptions } from "@xterm/addon-image";
+import { Unicode11Addon } from "@xterm/addon-unicode11";
 import "@xterm/xterm/css/xterm.css";
-
-const sessionBufferCache = new Map<string, string>();
-
-export function clearTerminalSessionCache(sessionId: string) {
-  sessionBufferCache.delete(sessionId);
-}
 
 export type TerminalKeywordSettings = {
   enabled: boolean;
@@ -33,7 +33,7 @@ export type TerminalKeywordSettings = {
 type TerminalViewProps = {
   tabId: string;
   sessionId: string | null;
-  onDisconnected: (tabId: string) => void;
+  onDisconnected: (tabId: string, sessionId: string) => void;
   keywordSettings: TerminalKeywordSettings;
 };
 
@@ -82,6 +82,7 @@ export function TerminalView({ tabId, sessionId, onDisconnected, keywordSettings
   const suppressPasteResetTimerRef = useRef<number | null>(null);
   const lastClipboardPayloadRef = useRef<string>("");
   const lastClipboardAtRef = useRef(0);
+  const [terminalReady, setTerminalReady] = useState(false);
 
   useEffect(() => {
     const term = terminalRef.current;
@@ -96,53 +97,62 @@ export function TerminalView({ tabId, sessionId, onDisconnected, keywordSettings
 
   useEffect(() => {
     if (!hostRef.current) return;
+    const host = hostRef.current;
+
     const term = new Terminal({
       cursorBlink: true,
       cursorStyle: "block",
       convertEol: true,
-      fontFamily: '"JetBrains Mono", "Cascadia Code", "Fira Code", Menlo, Consolas, monospace',
+      fontFamily: TERMINAL_FONT_FAMILY,
       fontSize: 13,
       lineHeight: 1.2,
       letterSpacing: 0,
       scrollback: 10000,
-      allowTransparency: false, // must be false for WebGL renderer
-      // Ensure the internal canvas matches the physical pixel grid — this is
-      // what makes Terminus look sharper. xterm reads window.devicePixelRatio
-      // automatically when the WebGL renderer is active, but we also help the
-      // DOM fallback by not artificially squashing the canvas.
-      // Disable minimum contrast ratio enforcement so colors render exactly
-      // as the application sends them (matches Terminus default behaviour).
+      allowTransparency: false,
       minimumContrastRatio: 1,
       theme: getTerminalTheme(themeId),
     });
     const fitAddon = new FitAddon();
     const webLinksAddon = new WebLinksAddon((_event, uri) => {
-      // Open URLs emitted by terminal output in the system browser.
       void openUrl(uri);
     });
-
-    // Image protocol support (sixel + iTerm2 inline images).
     const imageOptions: IImageAddonOptions = {
       enableSizeReports: true,
-      pixelLimit: 16777216, // 16 MiB — allows large sixel/kitty images
-      storageLimit: 256,    // 256 MB image cache
+      pixelLimit: 16777216,
+      storageLimit: 256,
       sixelSupport: true,
       sixelScrolling: true,
       sixelPaletteLimit: 256,
-      iipSupport: true,     // iTerm2 inline image protocol
+      iipSupport: true,
     };
     const imageAddon = new ImageAddon(imageOptions);
+    const unicode11Addon = new Unicode11Addon();
 
     term.loadAddon(fitAddon);
     term.loadAddon(webLinksAddon);
     term.loadAddon(imageAddon);
-    term.open(hostRef.current);
+    try {
+      term.loadAddon(unicode11Addon);
+      term.unicode.activeVersion = "11";
+    } catch {
+      // Unicode11 is optional — terminal still works without it.
+    }
+    term.open(host);
+
+    void loadTerminalFonts().then(() => {
+      if (terminalRef.current !== term) return;
+      term.options.fontFamily = TERMINAL_FONT_FAMILY;
+      try {
+        term.refresh(0, term.rows - 1);
+      } catch {
+        // ignore
+      }
+    });
 
     const sendClipboardToPty = (text: string) => {
       const activeSessionId = activeSessionIdRef.current;
       if (!activeSessionId || !text) return;
       const now = Date.now();
-      // Guard against duplicate browser/terminal paste paths firing together.
       if (text === lastClipboardPayloadRef.current && now - lastClipboardAtRef.current < 400) {
         return;
       }
@@ -200,22 +210,22 @@ export function TerminalView({ tabId, sessionId, onDisconnected, keywordSettings
           // ignore
         });
     };
-    hostRef.current.addEventListener("paste", onPaste, { capture: true });
+    host.addEventListener("paste", onPaste, { capture: true });
 
-    // WebGL renderer — GPU-accelerated, sharpest text + graphics.
-    // Falls back silently if WebGL is unavailable (e.g. in software rendering).
     let webglAddon: WebglAddon | null = null;
-    try {
-      webglAddon = new WebglAddon();
-      webglAddon.onContextLoss(() => {
-        // Context lost (e.g. GPU driver reset). Dispose and fall back to DOM.
-        webglAddon?.dispose();
-        webglAddon = null;
-      });
-      term.loadAddon(webglAddon);
-    } catch {
-      // GPU unavailable — DOM renderer will be used automatically.
-    }
+    const webglFrame = window.requestAnimationFrame(() => {
+      if (terminalRef.current !== term) return;
+      try {
+        webglAddon = new WebglAddon();
+        webglAddon.onContextLoss(() => {
+          webglAddon?.dispose();
+          webglAddon = null;
+        });
+        term.loadAddon(webglAddon);
+      } catch {
+        // GPU unavailable — DOM renderer will be used automatically.
+      }
+    });
 
     const safeFit = () => {
       try {
@@ -237,6 +247,7 @@ export function TerminalView({ tabId, sessionId, onDisconnected, keywordSettings
 
     terminalRef.current = term;
     fitAddonRef.current = fitAddon;
+    setTerminalReady(true);
 
     setTerminalClipboardBridge({
       term,
@@ -258,7 +269,8 @@ export function TerminalView({ tabId, sessionId, onDisconnected, keywordSettings
     }
 
     return () => {
-      hostRef.current?.removeEventListener("paste", onPaste, { capture: true });
+      window.cancelAnimationFrame(webglFrame);
+      host.removeEventListener("paste", onPaste, { capture: true });
       if (suppressPasteResetTimerRef.current) {
         window.clearTimeout(suppressPasteResetTimerRef.current);
         suppressPasteResetTimerRef.current = null;
@@ -266,14 +278,17 @@ export function TerminalView({ tabId, sessionId, onDisconnected, keywordSettings
       setTerminalClipboardBridge(null);
       window.removeEventListener("resize", onResize);
       observer?.disconnect();
+      unicode11Addon.dispose();
       webglAddon?.dispose();
       term.dispose();
       terminalRef.current = null;
       fitAddonRef.current = null;
+      setTerminalReady(false);
     };
   }, []);
 
   useEffect(() => {
+    if (!terminalReady) return;
     const term = terminalRef.current;
     if (!term) return;
     activeSessionIdRef.current = sessionId;
@@ -298,53 +313,26 @@ export function TerminalView({ tabId, sessionId, onDisconnected, keywordSettings
     }
 
     term.clear();
-    const cached = sessionBufferCache.get(sessionId);
+    const cached = getTerminalSessionBuffer(sessionId);
     if (cached) {
-      term.write(cached);
+      term.write(highlightChunk(cached, keywordSettings));
     }
 
     const disposeInput = term.onData((data) => {
       void invoke("ssh_send_input", { sessionId, input: data }).catch(() => {
-        onDisconnected(tabId);
+        onDisconnected(tabId, sessionId);
       });
     });
 
-    let outputRaf = 0;
-    let pendingOutput = "";
-    const flushOutput = () => {
-      outputRaf = 0;
-      if (!pendingOutput) return;
-      const highlighted = highlightChunk(pendingOutput, keywordSettings);
-      pendingOutput = "";
-      const previous = sessionBufferCache.get(sessionId) ?? "";
-      sessionBufferCache.set(sessionId, previous + highlighted);
-      term.write(highlighted);
-    };
-
-    const timer = window.setInterval(() => {
-      void invoke<string[]>("ssh_read_output", { sessionId })
-        .then((chunks) => {
-          if (chunks.length === 0) return;
-          for (const chunk of chunks) {
-            pendingOutput += chunk;
-          }
-          if (!outputRaf) {
-            outputRaf = window.requestAnimationFrame(flushOutput);
-          }
-        })
-        .catch(() => {
-          onDisconnected(tabId);
-        });
-    }, 50);
+    const unsubscribeOutput = subscribeTerminalSessionOutput(sessionId, (chunk) => {
+      term.write(highlightChunk(chunk, keywordSettings));
+    });
 
     return () => {
       disposeInput.dispose();
-      window.clearInterval(timer);
-      if (outputRaf) {
-        window.cancelAnimationFrame(outputRaf);
-      }
+      unsubscribeOutput();
     };
-  }, [sessionId, tabId, onDisconnected, keywordSettings]);
+  }, [terminalReady, sessionId, tabId, onDisconnected, keywordSettings]);
 
   return (
     <div

@@ -4,6 +4,7 @@ import App from "./App";
 import { GlobalContextMenu } from "@/components/global-context-menu";
 import { initTheme } from "@/lib/themes";
 import { dismissSplashWhenReady } from "@/lib/splash";
+import "@/lib/terminal-fonts";
 import "./index.css";
 
 initTheme();

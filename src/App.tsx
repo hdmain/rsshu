@@ -33,10 +33,14 @@ import { Input } from "@/components/ui/input";
 import { Dropdown } from "@/components/ui/dropdown";
 import { Separator } from "@/components/ui/separator";
 import {
-  clearTerminalSessionCache,
   TerminalView,
   type TerminalKeywordSettings,
 } from "@/components/terminal-view";
+import {
+  clearTerminalSessionCache,
+  setShellSessionLostHandler,
+  syncShellSessionPoller,
+} from "@/lib/shell-session-poller";
 import { SftpView, clearSftpSessionCache } from "@/components/sftp-view";
 import { TitleBar } from "@/components/title-bar";
 import { VaultOverlay } from "@/components/vault-overlay";
@@ -1367,32 +1371,41 @@ function App() {
     }
   }
 
-  const handleSessionLost = useCallback(
-    (tabId: string) => {
-      const tab = tabs.find((t) => t.id === tabId);
-      if (!tab?.sessionId) return;
-      const sid = tab.sessionId;
-      clearTerminalSessionCache(sid);
-      void invoke("ssh_close_shell", { sessionId: sid }).catch(() => {});
-      setTabs((prev) =>
-        prev.map((t) =>
-          t.id === tabId
-            ? {
-                ...t,
-                sessionId: null,
-                disconnected: true,
-                disconnectReason:
-                  "The SSH session closed (remote ended the shell, network interruption, or transport error).",
-              }
-            : t
-        )
+  const handleSessionLost = useCallback((tabId: string, sessionId: string) => {
+    clearTerminalSessionCache(sessionId);
+    void invoke("ssh_close_shell", { sessionId }).catch(() => {});
+    setTabs((prev) => {
+      const tab = prev.find((t) => t.id === tabId);
+      if (!tab || tab.sessionId !== sessionId) return prev;
+      return prev.map((t) =>
+        t.id === tabId
+          ? {
+              ...t,
+              sessionId: null,
+              disconnected: true,
+              disconnectReason:
+                "The SSH session closed (remote ended the shell, network interruption, or transport error).",
+            }
+          : t,
       );
-      if (activeTabId === tabId) {
-        setTerminalState("disconnected");
-      }
-    },
-    [tabs, activeTabId]
-  );
+    });
+    if (activeTabIdRef.current === tabId) {
+      setTerminalState("disconnected");
+    }
+  }, []);
+
+  useEffect(() => {
+    setShellSessionLostHandler(handleSessionLost);
+    return () => setShellSessionLostHandler(null);
+  }, [handleSessionLost]);
+
+  useEffect(() => {
+    const sessions = tabs
+      .filter((t): t is SessionTab & { sessionId: string } => Boolean(t.sessionId) && !t.disconnected)
+      .map((t) => ({ tabId: t.id, sessionId: t.sessionId }));
+    syncShellSessionPoller(sessions);
+    return () => syncShellSessionPoller([]);
+  }, [tabs]);
 
   function sessionTabLabel(host: Host): string {
     return `${host.name} (${host.username}@${host.host})`;
