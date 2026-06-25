@@ -5,7 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { readText } from "@tauri-apps/plugin-clipboard-manager";
 import { setTerminalClipboardBridge } from "@/lib/terminal-clipboard-bridge";
-import { loadTerminalFonts, TERMINAL_FONT_FAMILY } from "@/lib/terminal-fonts";
+import { loadTerminalFonts, preferWebglRenderer, TERMINAL_FONT_FAMILY, TERMINAL_FONT_SIZE } from "@/lib/terminal-fonts";
 import {
   getTerminalSessionBuffer,
   subscribeTerminalSessionOutput,
@@ -70,6 +70,14 @@ function highlightChunk(chunk: string, settings: TerminalKeywordSettings) {
   return out;
 }
 
+function relayoutTerminal(term: Terminal, fitAddon: FitAddon): void {
+  const family = term.options.fontFamily;
+  term.options.fontFamily = "monospace";
+  term.options.fontFamily = family;
+  fitAddon.fit();
+  term.refresh(0, term.rows - 1);
+}
+
 export function TerminalView({ tabId, sessionId, onDisconnected, keywordSettings }: TerminalViewProps) {
   const { themeId } = useTheme();
   const wrapperRef = useRef<HTMLDivElement | null>(null);
@@ -86,9 +94,12 @@ export function TerminalView({ tabId, sessionId, onDisconnected, keywordSettings
 
   useEffect(() => {
     const term = terminalRef.current;
+    const host = hostRef.current;
     if (!term) return;
     const apply = () => {
-      term.options.theme = getTerminalTheme(themeId);
+      const theme = getTerminalTheme(themeId);
+      term.options.theme = theme;
+      host?.style.setProperty("--xterm-bg", theme.background ?? "#050912");
     };
     apply();
     window.addEventListener("themechange", apply);
@@ -98,192 +109,196 @@ export function TerminalView({ tabId, sessionId, onDisconnected, keywordSettings
   useEffect(() => {
     if (!hostRef.current) return;
     const host = hostRef.current;
+    let disposed = false;
+    const cleanupRef = { current: null as (() => void) | null };
 
-    const term = new Terminal({
-      cursorBlink: true,
-      cursorStyle: "block",
-      convertEol: true,
-      fontFamily: TERMINAL_FONT_FAMILY,
-      fontSize: 13,
-      lineHeight: 1.2,
-      letterSpacing: 0,
-      scrollback: 10000,
-      allowTransparency: false,
-      minimumContrastRatio: 1,
-      theme: getTerminalTheme(themeId),
-    });
-    const fitAddon = new FitAddon();
-    const webLinksAddon = new WebLinksAddon((_event, uri) => {
-      void openUrl(uri);
-    });
-    const imageOptions: IImageAddonOptions = {
-      enableSizeReports: true,
-      pixelLimit: 16777216,
-      storageLimit: 256,
-      sixelSupport: true,
-      sixelScrolling: true,
-      sixelPaletteLimit: 256,
-      iipSupport: true,
-    };
-    const imageAddon = new ImageAddon(imageOptions);
-    const unicode11Addon = new Unicode11Addon();
+    void (async () => {
+      await loadTerminalFonts();
+      if (disposed || !hostRef.current) return;
 
-    term.loadAddon(fitAddon);
-    term.loadAddon(webLinksAddon);
-    term.loadAddon(imageAddon);
-    try {
-      term.loadAddon(unicode11Addon);
-      term.unicode.activeVersion = "11";
-    } catch {
-      // Unicode11 is optional — terminal still works without it.
-    }
-    term.open(host);
+      const term = new Terminal({
+        cursorBlink: true,
+        cursorStyle: "block",
+        convertEol: true,
+        fontFamily: TERMINAL_FONT_FAMILY,
+        fontSize: TERMINAL_FONT_SIZE,
+        lineHeight: 1,
+        letterSpacing: 0,
+        scrollback: 10000,
+        allowTransparency: false,
+        minimumContrastRatio: 1,
+        theme: getTerminalTheme(themeId),
+      });
+      const fitAddon = new FitAddon();
+      const webLinksAddon = new WebLinksAddon((_event, uri) => {
+        void openUrl(uri);
+      });
+      const imageOptions: IImageAddonOptions = {
+        enableSizeReports: true,
+        pixelLimit: 16777216,
+        storageLimit: 256,
+        sixelSupport: true,
+        sixelScrolling: true,
+        sixelPaletteLimit: 256,
+        iipSupport: true,
+      };
+      const imageAddon = new ImageAddon(imageOptions);
+      const unicode11Addon = new Unicode11Addon();
 
-    void loadTerminalFonts().then(() => {
-      if (terminalRef.current !== term) return;
-      term.options.fontFamily = TERMINAL_FONT_FAMILY;
+      term.loadAddon(fitAddon);
+      term.loadAddon(webLinksAddon);
+      term.loadAddon(imageAddon);
       try {
-        term.refresh(0, term.rows - 1);
+        term.loadAddon(unicode11Addon);
+        term.unicode.activeVersion = "11";
       } catch {
-        // ignore
+        // Unicode11 is optional — terminal still works without it.
       }
-    });
+      term.open(host);
 
-    const sendClipboardToPty = (text: string) => {
-      const activeSessionId = activeSessionIdRef.current;
-      if (!activeSessionId || !text) return;
-      const now = Date.now();
-      if (text === lastClipboardPayloadRef.current && now - lastClipboardAtRef.current < 400) {
-        return;
+      const sendClipboardToPty = (text: string) => {
+        const activeSessionId = activeSessionIdRef.current;
+        if (!activeSessionId || !text) return;
+        const now = Date.now();
+        if (text === lastClipboardPayloadRef.current && now - lastClipboardAtRef.current < 400) {
+          return;
+        }
+        lastClipboardPayloadRef.current = text;
+        lastClipboardAtRef.current = now;
+        void invoke("ssh_send_input", { sessionId: activeSessionId, input: text });
+      };
+
+      term.attachCustomKeyEventHandler((e) => {
+        const key = e.key.toLowerCase();
+        const isCtrlPaste = e.ctrlKey && !e.shiftKey && !e.altKey && key === "v";
+        const isShiftInsertPaste = e.shiftKey && !e.ctrlKey && !e.altKey && e.key === "Insert";
+        if (!isCtrlPaste && !isShiftInsertPaste) return true;
+        e.preventDefault();
+        e.stopPropagation();
+        suppressNextPasteEventRef.current = true;
+        if (suppressPasteResetTimerRef.current) {
+          window.clearTimeout(suppressPasteResetTimerRef.current);
+        }
+        suppressPasteResetTimerRef.current = window.setTimeout(() => {
+          suppressNextPasteEventRef.current = false;
+          suppressPasteResetTimerRef.current = null;
+        }, 1000);
+        void readText()
+          .then((text) => sendClipboardToPty(text))
+          .catch(() => {
+            // ignore
+          });
+        return false;
+      });
+
+      const onPaste = (event: ClipboardEvent) => {
+        const activeSessionId = activeSessionIdRef.current;
+        if (!activeSessionId) return;
+        event.preventDefault();
+        event.stopPropagation();
+        if (suppressNextPasteEventRef.current) {
+          suppressNextPasteEventRef.current = false;
+          if (suppressPasteResetTimerRef.current) {
+            window.clearTimeout(suppressPasteResetTimerRef.current);
+            suppressPasteResetTimerRef.current = null;
+          }
+          return;
+        }
+        const text = event.clipboardData?.getData("text");
+        if (text) {
+          sendClipboardToPty(text);
+          return;
+        }
+        void readText()
+          .then((fallbackText) => {
+            if (fallbackText) sendClipboardToPty(fallbackText);
+          })
+          .catch(() => {
+            // ignore
+          });
+      };
+      host.addEventListener("paste", onPaste, { capture: true });
+
+      let webglAddon: WebglAddon | null = null;
+
+      const safeFit = () => {
+        try {
+          fitAddon.fit();
+          const cols = term.cols;
+          const rows = term.rows;
+          const last = lastSizeRef.current;
+          const activeSessionId = activeSessionIdRef.current;
+          if (activeSessionId && cols > 0 && rows > 0 && (!last || last.cols !== cols || last.rows !== rows)) {
+            lastSizeRef.current = { cols, rows };
+            void invoke("ssh_resize_pty", { sessionId: activeSessionId, cols, rows });
+          }
+        } catch {
+          // Container may momentarily have 0 size during layout transitions.
+        }
+      };
+
+      safeFit();
+
+      if (preferWebglRenderer()) {
+        try {
+          webglAddon = new WebglAddon();
+          webglAddon.onContextLoss(() => {
+            webglAddon?.dispose();
+            webglAddon = null;
+          });
+          term.loadAddon(webglAddon);
+          relayoutTerminal(term, fitAddon);
+          safeFit();
+        } catch {
+          // GPU unavailable — DOM renderer will be used automatically.
+        }
       }
-      lastClipboardPayloadRef.current = text;
-      lastClipboardAtRef.current = now;
-      void invoke("ssh_send_input", { sessionId: activeSessionId, input: text });
-    };
 
-    term.attachCustomKeyEventHandler((e) => {
-      const key = e.key.toLowerCase();
-      const isCtrlPaste = e.ctrlKey && !e.shiftKey && !e.altKey && key === "v";
-      const isShiftInsertPaste = e.shiftKey && !e.ctrlKey && !e.altKey && e.key === "Insert";
-      if (!isCtrlPaste && !isShiftInsertPaste) return true;
-      e.preventDefault();
-      e.stopPropagation();
-      suppressNextPasteEventRef.current = true;
-      if (suppressPasteResetTimerRef.current) {
-        window.clearTimeout(suppressPasteResetTimerRef.current);
+      terminalRef.current = term;
+      fitAddonRef.current = fitAddon;
+      setTerminalReady(true);
+
+      setTerminalClipboardBridge({
+        term,
+        hasSession: () => activeSessionIdRef.current != null,
+        sendToPty: (data) => {
+          const id = activeSessionIdRef.current;
+          if (!id) return;
+          void invoke("ssh_send_input", { sessionId: id, input: data });
+        },
+      });
+
+      const onResize = () => safeFit();
+      window.addEventListener("resize", onResize);
+
+      let observer: ResizeObserver | null = null;
+      if (wrapperRef.current && typeof ResizeObserver !== "undefined") {
+        observer = new ResizeObserver(() => safeFit());
+        observer.observe(wrapperRef.current);
       }
-      suppressPasteResetTimerRef.current = window.setTimeout(() => {
-        suppressNextPasteEventRef.current = false;
-        suppressPasteResetTimerRef.current = null;
-      }, 1000);
-      void readText()
-        .then((text) => sendClipboardToPty(text))
-        .catch(() => {
-          // ignore
-        });
-      return false;
-    });
 
-    const onPaste = (event: ClipboardEvent) => {
-      const activeSessionId = activeSessionIdRef.current;
-      if (!activeSessionId) return;
-      event.preventDefault();
-      event.stopPropagation();
-      if (suppressNextPasteEventRef.current) {
-        suppressNextPasteEventRef.current = false;
+      cleanupRef.current = () => {
+        host.removeEventListener("paste", onPaste, { capture: true });
         if (suppressPasteResetTimerRef.current) {
           window.clearTimeout(suppressPasteResetTimerRef.current);
           suppressPasteResetTimerRef.current = null;
         }
-        return;
-      }
-      const text = event.clipboardData?.getData("text");
-      if (text) {
-        sendClipboardToPty(text);
-        return;
-      }
-      void readText()
-        .then((fallbackText) => {
-          if (fallbackText) sendClipboardToPty(fallbackText);
-        })
-        .catch(() => {
-          // ignore
-        });
-    };
-    host.addEventListener("paste", onPaste, { capture: true });
-
-    let webglAddon: WebglAddon | null = null;
-    const webglFrame = window.requestAnimationFrame(() => {
-      if (terminalRef.current !== term) return;
-      try {
-        webglAddon = new WebglAddon();
-        webglAddon.onContextLoss(() => {
-          webglAddon?.dispose();
-          webglAddon = null;
-        });
-        term.loadAddon(webglAddon);
-      } catch {
-        // GPU unavailable — DOM renderer will be used automatically.
-      }
-    });
-
-    const safeFit = () => {
-      try {
-        fitAddon.fit();
-        const cols = term.cols;
-        const rows = term.rows;
-        const last = lastSizeRef.current;
-        const activeSessionId = activeSessionIdRef.current;
-        if (activeSessionId && cols > 0 && rows > 0 && (!last || last.cols !== cols || last.rows !== rows)) {
-          lastSizeRef.current = { cols, rows };
-          void invoke("ssh_resize_pty", { sessionId: activeSessionId, cols, rows });
-        }
-      } catch {
-        // Container may momentarily have 0 size during layout transitions.
-      }
-    };
-
-    safeFit();
-
-    terminalRef.current = term;
-    fitAddonRef.current = fitAddon;
-    setTerminalReady(true);
-
-    setTerminalClipboardBridge({
-      term,
-      hasSession: () => activeSessionIdRef.current != null,
-      sendToPty: (data) => {
-        const id = activeSessionIdRef.current;
-        if (!id) return;
-        void invoke("ssh_send_input", { sessionId: id, input: data });
-      },
-    });
-
-    const onResize = () => safeFit();
-    window.addEventListener("resize", onResize);
-
-    let observer: ResizeObserver | null = null;
-    if (wrapperRef.current && typeof ResizeObserver !== "undefined") {
-      observer = new ResizeObserver(() => safeFit());
-      observer.observe(wrapperRef.current);
-    }
+        setTerminalClipboardBridge(null);
+        window.removeEventListener("resize", onResize);
+        observer?.disconnect();
+        unicode11Addon.dispose();
+        webglAddon?.dispose();
+        term.dispose();
+        terminalRef.current = null;
+        fitAddonRef.current = null;
+        setTerminalReady(false);
+      };
+    })();
 
     return () => {
-      window.cancelAnimationFrame(webglFrame);
-      host.removeEventListener("paste", onPaste, { capture: true });
-      if (suppressPasteResetTimerRef.current) {
-        window.clearTimeout(suppressPasteResetTimerRef.current);
-        suppressPasteResetTimerRef.current = null;
-      }
-      setTerminalClipboardBridge(null);
-      window.removeEventListener("resize", onResize);
-      observer?.disconnect();
-      unicode11Addon.dispose();
-      webglAddon?.dispose();
-      term.dispose();
-      terminalRef.current = null;
-      fitAddonRef.current = null;
-      setTerminalReady(false);
+      disposed = true;
+      cleanupRef.current?.();
+      cleanupRef.current = null;
     };
   }, []);
 

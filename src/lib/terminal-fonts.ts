@@ -1,18 +1,25 @@
-import "@azurity/pure-nerd-font/pure-nerd-font.css";
+import "../terminal-fonts.css";
 
-/** Monospace stack with Nerd Font icons + system emoji fallbacks. */
+/** Single patched Nerd Font — text + icons in one face (required for WebGL atlas). */
 export const TERMINAL_FONT_FAMILY =
-  '"JetBrains Mono", "Cascadia Code", "Fira Code", Menlo, Consolas, "Pure Nerd Font", "Segoe UI Emoji", "Noto Color Emoji", "Apple Color Emoji", monospace';
+  '"JetBrainsMono Nerd Font Mono", "Noto Color Emoji", "Segoe UI Emoji", monospace';
 
-export async function loadTerminalFonts(fontSize = 13): Promise<void> {
-  const load = document.fonts.load(`${fontSize}px "Pure Nerd Font"`);
+export const TERMINAL_FONT_SIZE = 14;
+
+export function preferWebglRenderer(): boolean {
+  if (typeof navigator === "undefined") return true;
+  // WebGL glyph atlas is unreliable on many Linux GPU stacks (gray blocks / transparency).
+  return !/linux/i.test(navigator.userAgent);
+}
+
+export async function loadTerminalFonts(fontSize = TERMINAL_FONT_SIZE): Promise<void> {
   try {
     await Promise.race([
-      load,
-      new Promise<void>((resolve) => window.setTimeout(resolve, 3000)),
+      document.fonts.load(`${fontSize}px "JetBrainsMono Nerd Font Mono"`),
+      new Promise<void>((resolve) => window.setTimeout(resolve, 5000)),
     ]);
     await document.fonts.ready;
   } catch {
-    // Fall back to system monospace / emoji fonts.
+    // Fall back to system monospace.
   }
 }

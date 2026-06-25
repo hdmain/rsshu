@@ -198,6 +198,11 @@
   -moz-osx-font-smoothing: grayscale;
 }
 
+.xterm .xterm-viewport,
+.xterm .xterm-screen {
+  background-color: var(--xterm-bg, transparent) !important;
+}
+
 .xterm .xterm-screen {
   font-weight: 450;
 }
