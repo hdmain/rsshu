@@ -112,6 +112,8 @@ type UpdateCheckResponse = {
   available_for_os: boolean;
   os: string;
   arch: string;
+  linux_distro: string | null;
+  package_format: string | null;
   release_url: string | null;
   asset_name: string | null;
   message: string;
@@ -2164,7 +2166,11 @@ function App() {
                         <div className="app-card app-soft rounded-md px-3 py-2">
                           <p className="app-text-muted">Platform checked</p>
                           <p className="app-text-strong font-mono">
-                            {updateCheck ? `${updateCheck.os}-${updateCheck.arch}` : "not checked"}
+                            {updateCheck
+                              ? updateCheck.linux_distro
+                                ? `${updateCheck.linux_distro}${updateCheck.package_format ? ` · ${updateCheck.package_format}` : ""} · ${updateCheck.arch}`
+                                : `${updateCheck.os}-${updateCheck.arch}`
+                              : "not checked"}
                           </p>
                         </div>
                         <div className="app-card app-soft rounded-md px-3 py-2">

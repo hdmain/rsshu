@@ -80,6 +80,8 @@ struct UpdateCheckResponse {
     available_for_os: bool,
     os: String,
     arch: String,
+    linux_distro: Option<String>,
+    package_format: Option<String>,
     release_url: Option<String>,
     asset_name: Option<String>,
     message: String,
@@ -349,6 +351,149 @@ fn current_update_arch() -> String {
     std::env::consts::ARCH.to_string()
 }
 
+#[derive(Debug, Clone)]
+struct LinuxDistroInfo {
+    id: String,
+    name: String,
+    id_like: Vec<String>,
+}
+
+fn parse_os_release(content: &str) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            let value = value.trim().trim_matches('"');
+            map.insert(key.trim().to_string(), value.to_string());
+        }
+    }
+    map
+}
+
+fn detect_linux_distro() -> Option<LinuxDistroInfo> {
+    if std::env::consts::OS != "linux" {
+        return None;
+    }
+    let content = std::fs::read_to_string("/etc/os-release").ok()?;
+    let map = parse_os_release(&content);
+    let id = map.get("ID")?.clone();
+    let name = map
+        .get("PRETTY_NAME")
+        .or_else(|| map.get("NAME"))
+        .cloned()
+        .unwrap_or_else(|| id.clone());
+    let id_like = map
+        .get("ID_LIKE")
+        .map(|value| {
+            value
+                .split_whitespace()
+                .map(|part| part.to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Some(LinuxDistroInfo { id, name, id_like })
+}
+
+fn is_debian_based(distro: &LinuxDistroInfo) -> bool {
+    let id = distro.id.to_ascii_lowercase();
+    if id == "debian" {
+        return true;
+    }
+    if distro
+        .id_like
+        .iter()
+        .any(|like| like.eq_ignore_ascii_case("debian"))
+    {
+        return true;
+    }
+    // Ubuntu derivatives (Mint, Pop!_OS, etc.) usually declare ID_LIKE=ubuntu.
+    id == "ubuntu"
+        || distro
+            .id_like
+            .iter()
+            .any(|like| like.eq_ignore_ascii_case("ubuntu"))
+}
+
+fn package_format_from_asset(name: &str) -> Option<String> {
+    let n = name.to_ascii_lowercase();
+    if n.ends_with(".deb") {
+        Some("deb".to_string())
+    } else if n.ends_with(".appimage") {
+        Some("appimage".to_string())
+    } else if n.ends_with(".msi") {
+        Some("msi".to_string())
+    } else if n.ends_with(".exe") {
+        Some("exe".to_string())
+    } else {
+        None
+    }
+}
+
+fn asset_install_priority(
+    name: &str,
+    os: &str,
+    arch: &str,
+    linux_distro: Option<&LinuxDistroInfo>,
+) -> Option<u8> {
+    let n = name.to_ascii_lowercase();
+    if !asset_matches_arch(&n, arch) {
+        return None;
+    }
+
+    match os {
+        "windows" => {
+            if n.ends_with(".exe") && n.contains("setup") {
+                Some(0)
+            } else if n.ends_with(".msi") {
+                Some(1)
+            } else if n.ends_with(".exe") {
+                Some(2)
+            } else {
+                None
+            }
+        }
+        "linux" => {
+            let debian_based = linux_distro.map(is_debian_based).unwrap_or(false);
+            if debian_based {
+                if n.ends_with(".deb") {
+                    Some(0)
+                } else if n.ends_with(".appimage") {
+                    Some(1)
+                } else {
+                    None
+                }
+            } else if n.ends_with(".appimage") {
+                Some(0)
+            } else if n.ends_with(".deb") {
+                Some(1)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn matching_update_asset(
+    release: &GithubRelease,
+    os: &str,
+    arch: &str,
+) -> Option<GithubReleaseAsset> {
+    let linux_distro = detect_linux_distro();
+    let linux_ref = linux_distro.as_ref();
+    release
+        .assets
+        .iter()
+        .filter_map(|asset| {
+            asset_install_priority(&asset.name, os, arch, linux_ref).map(|priority| (priority, asset))
+        })
+        .min_by_key(|(priority, _)| *priority)
+        .map(|(_, asset)| asset.clone())
+}
+
 fn normalize_version(version: &str) -> &str {
     version.trim().trim_start_matches('v')
 }
@@ -388,50 +533,6 @@ fn asset_matches_arch(name: &str, arch: &str) -> bool {
     }
 }
 
-fn asset_install_priority(name: &str, os: &str, arch: &str) -> Option<u8> {
-    let n = name.to_ascii_lowercase();
-    if !asset_matches_arch(&n, arch) {
-        return None;
-    }
-
-    match os {
-        "windows" => {
-            if n.ends_with(".exe") && n.contains("setup") {
-                Some(0)
-            } else if n.ends_with(".msi") {
-                Some(1)
-            } else if n.ends_with(".exe") {
-                Some(2)
-            } else {
-                None
-            }
-        }
-        "linux" => {
-            if n.ends_with(".appimage") {
-                Some(0)
-            } else if n.ends_with(".deb") {
-                Some(1)
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
-
-fn matching_update_asset(
-    release: &GithubRelease,
-    os: &str,
-    arch: &str,
-) -> Option<GithubReleaseAsset> {
-    release
-        .assets
-        .iter()
-        .filter_map(|asset| asset_install_priority(&asset.name, os, arch).map(|p| (p, asset)))
-        .min_by_key(|(priority, _)| *priority)
-        .map(|(_, asset)| asset.clone())
-}
-
 fn fetch_latest_release(proxy_state: &ProxyState) -> Result<GithubRelease> {
     let url = format!("https://api.github.com/repos/{UPDATE_REPO}/releases/latest");
     let res = build_http_client(proxy_state)
@@ -455,16 +556,32 @@ fn build_update_check_response(release: GithubRelease) -> UpdateCheckResponse {
     let latest_version = normalize_version(&release.tag_name).to_string();
     let os = current_update_os();
     let arch = current_update_arch();
+    let linux_distro = detect_linux_distro();
+    let linux_distro_label = linux_distro.as_ref().map(|d| d.name.clone());
     let asset = matching_update_asset(&release, &os, &arch);
+    let package_format = asset
+        .as_ref()
+        .and_then(|a| package_format_from_asset(&a.name));
     let available_for_os = asset.is_some();
     let newer = is_newer_version(&latest_version, &current_version);
     let update_available = newer && available_for_os;
-    let message = if update_available {
-        format!("Update {latest_version} is available for {os}-{arch}.")
-    } else if newer {
-        format!("Update {latest_version} exists, but no installer asset matches {os}-{arch}.")
+
+    let target_label = if let Some(ref distro_name) = linux_distro_label {
+        if let Some(ref format) = package_format {
+            format!("{distro_name} ({format}, {arch})")
+        } else {
+            format!("{distro_name} ({arch})")
+        }
     } else {
-        format!("RSSHU is up to date for {os}-{arch}.")
+        format!("{os}-{arch}")
+    };
+
+    let message = if update_available {
+        format!("Update {latest_version} is available for {target_label}.")
+    } else if newer {
+        format!("Update {latest_version} exists, but no installer asset matches {target_label}.")
+    } else {
+        format!("RSSHU is up to date for {target_label}.")
     };
 
     UpdateCheckResponse {
@@ -474,6 +591,8 @@ fn build_update_check_response(release: GithubRelease) -> UpdateCheckResponse {
         available_for_os,
         os,
         arch,
+        linux_distro: linux_distro_label,
+        package_format,
         release_url: Some(release.html_url),
         asset_name: asset.map(|a| a.name),
         message,
