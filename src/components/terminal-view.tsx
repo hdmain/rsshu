@@ -35,6 +35,8 @@ type TerminalViewProps = {
   sessionId: string | null;
   onDisconnected: (tabId: string, sessionId: string) => void;
   keywordSettings: TerminalKeywordSettings;
+  /** Changes when surrounding chrome (e.g. host info bar) resizes the terminal pane. */
+  layoutKey?: boolean;
 };
 
 function hexToRgb(hex: string): { r: number; g: number; b: number } | null {
@@ -70,15 +72,41 @@ function highlightChunk(chunk: string, settings: TerminalKeywordSettings) {
   return out;
 }
 
-function relayoutTerminal(term: Terminal, fitAddon: FitAddon): void {
+function fitTerminal(term: Terminal, fitAddon: FitAddon, host: HTMLElement): { cols: number; rows: number } | null {
+  fitAddon.fit();
+  const xtermEl = host.querySelector(".xterm") as HTMLElement | null;
+  if (xtermEl) {
+    let cols = term.cols;
+    let rows = term.rows;
+    // FitAddon uses clientHeight which includes padding on the host; trim rows until
+    // the canvas fits so the live prompt row is not clipped under chrome below.
+    while (rows > 1 && xtermEl.offsetHeight > host.clientHeight + 1) {
+      rows -= 1;
+      term.resize(cols, rows);
+    }
+  }
+  term.scrollToBottom();
+  term.refresh(0, term.rows - 1);
+  if (term.cols > 0 && term.rows > 0) {
+    return { cols: term.cols, rows: term.rows };
+  }
+  return null;
+}
+
+function relayoutTerminal(term: Terminal, fitAddon: FitAddon, host: HTMLElement): void {
   const family = term.options.fontFamily;
   term.options.fontFamily = "monospace";
   term.options.fontFamily = family;
-  fitAddon.fit();
-  term.refresh(0, term.rows - 1);
+  fitTerminal(term, fitAddon, host);
 }
 
-export function TerminalView({ tabId, sessionId, onDisconnected, keywordSettings }: TerminalViewProps) {
+export function TerminalView({
+  tabId,
+  sessionId,
+  onDisconnected,
+  keywordSettings,
+  layoutKey,
+}: TerminalViewProps) {
   const { themeId } = useTheme();
   const wrapperRef = useRef<HTMLDivElement | null>(null);
   const hostRef = useRef<HTMLDivElement | null>(null);
@@ -223,14 +251,20 @@ export function TerminalView({ tabId, sessionId, onDisconnected, keywordSettings
 
       const safeFit = () => {
         try {
-          fitAddon.fit();
-          const cols = term.cols;
-          const rows = term.rows;
+          const dims = fitTerminal(term, fitAddon, host);
+          if (!dims) return;
           const last = lastSizeRef.current;
           const activeSessionId = activeSessionIdRef.current;
-          if (activeSessionId && cols > 0 && rows > 0 && (!last || last.cols !== cols || last.rows !== rows)) {
-            lastSizeRef.current = { cols, rows };
-            void invoke("ssh_resize_pty", { sessionId: activeSessionId, cols, rows });
+          if (
+            activeSessionId &&
+            (!last || last.cols !== dims.cols || last.rows !== dims.rows)
+          ) {
+            lastSizeRef.current = dims;
+            void invoke("ssh_resize_pty", {
+              sessionId: activeSessionId,
+              cols: dims.cols,
+              rows: dims.rows,
+            });
           }
         } catch {
           // Container may momentarily have 0 size during layout transitions.
@@ -247,7 +281,7 @@ export function TerminalView({ tabId, sessionId, onDisconnected, keywordSettings
             webglAddon = null;
           });
           term.loadAddon(webglAddon);
-          relayoutTerminal(term, fitAddon);
+          relayoutTerminal(term, fitAddon, host);
           safeFit();
         } catch {
           // GPU unavailable — DOM renderer will be used automatically.
@@ -268,13 +302,25 @@ export function TerminalView({ tabId, sessionId, onDisconnected, keywordSettings
         },
       });
 
-      const onResize = () => safeFit();
+      let resizeRaf = 0;
+      const scheduleFit = () => {
+        cancelAnimationFrame(resizeRaf);
+        resizeRaf = requestAnimationFrame(() => {
+          safeFit();
+          requestAnimationFrame(() => safeFit());
+        });
+      };
+
+      const onResize = () => scheduleFit();
       window.addEventListener("resize", onResize);
 
       let observer: ResizeObserver | null = null;
-      if (wrapperRef.current && typeof ResizeObserver !== "undefined") {
-        observer = new ResizeObserver(() => safeFit());
-        observer.observe(wrapperRef.current);
+      if (typeof ResizeObserver !== "undefined") {
+        observer = new ResizeObserver(() => scheduleFit());
+        observer.observe(host);
+        if (wrapperRef.current) {
+          observer.observe(wrapperRef.current);
+        }
       }
 
       cleanupRef.current = () => {
@@ -284,6 +330,7 @@ export function TerminalView({ tabId, sessionId, onDisconnected, keywordSettings
           suppressPasteResetTimerRef.current = null;
         }
         setTerminalClipboardBridge(null);
+        cancelAnimationFrame(resizeRaf);
         window.removeEventListener("resize", onResize);
         observer?.disconnect();
         unicode11Addon.dispose();
@@ -305,6 +352,33 @@ export function TerminalView({ tabId, sessionId, onDisconnected, keywordSettings
   useEffect(() => {
     if (!terminalReady) return;
     const term = terminalRef.current;
+    const fitAddon = fitAddonRef.current;
+    const host = hostRef.current;
+    if (!term || !fitAddon || !host) return;
+    try {
+      const dims = fitTerminal(term, fitAddon, host);
+      const activeSessionId = activeSessionIdRef.current;
+      const last = lastSizeRef.current;
+      if (
+        activeSessionId &&
+        dims &&
+        (!last || last.cols !== dims.cols || last.rows !== dims.rows)
+      ) {
+        lastSizeRef.current = dims;
+        void invoke("ssh_resize_pty", {
+          sessionId: activeSessionId,
+          cols: dims.cols,
+          rows: dims.rows,
+        });
+      }
+    } catch {
+      // ignore transient sizing race
+    }
+  }, [terminalReady, layoutKey]);
+
+  useEffect(() => {
+    if (!terminalReady) return;
+    const term = terminalRef.current;
     if (!term) return;
     activeSessionIdRef.current = sessionId;
     if (!sessionId) {
@@ -315,12 +389,13 @@ export function TerminalView({ tabId, sessionId, onDisconnected, keywordSettings
     }
 
     const fitAddon = fitAddonRef.current;
-    if (fitAddon) {
+    const host = hostRef.current;
+    if (fitAddon && host) {
       try {
-        fitAddon.fit();
-        if (term.cols > 0 && term.rows > 0) {
-          lastSizeRef.current = { cols: term.cols, rows: term.rows };
-          void invoke("ssh_resize_pty", { sessionId, cols: term.cols, rows: term.rows });
+        const dims = fitTerminal(term, fitAddon, host);
+        if (dims) {
+          lastSizeRef.current = dims;
+          void invoke("ssh_resize_pty", { sessionId, cols: dims.cols, rows: dims.rows });
         }
       } catch {
         // ignore transient sizing race
@@ -332,6 +407,7 @@ export function TerminalView({ tabId, sessionId, onDisconnected, keywordSettings
     if (cached) {
       term.write(highlightChunk(cached, keywordSettings));
     }
+    term.scrollToBottom();
 
     const disposeInput = term.onData((data) => {
       void invoke("ssh_send_input", { sessionId, input: data }).catch(() => {
@@ -341,6 +417,10 @@ export function TerminalView({ tabId, sessionId, onDisconnected, keywordSettings
 
     const unsubscribeOutput = subscribeTerminalSessionOutput(sessionId, (chunk) => {
       term.write(highlightChunk(chunk, keywordSettings));
+      const buffer = term.buffer.active;
+      if (buffer.baseY + term.rows >= buffer.length) {
+        term.scrollToBottom();
+      }
     });
 
     return () => {
@@ -352,9 +432,9 @@ export function TerminalView({ tabId, sessionId, onDisconnected, keywordSettings
   return (
     <div
       ref={wrapperRef}
-      className="app-surface relative flex h-full w-full flex-1"
+      className="app-surface relative flex h-full min-h-0 w-full flex-1 px-3 py-2"
     >
-      <div ref={hostRef} className="h-full w-full px-3 py-2" />
+      <div ref={hostRef} className="h-full min-h-0 w-full overflow-hidden" />
     </div>
   );
 }

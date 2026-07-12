@@ -3037,6 +3037,7 @@ function App() {
                 tabId={activeTab.id}
                 sessionId={activeTab.sessionId}
                 keywordSettings={terminalKeywordSettings}
+                layoutKey={showTerminalHostInfoBar}
                 onDisconnected={handleSessionLost}
               />
             </div>
