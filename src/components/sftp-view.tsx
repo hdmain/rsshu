@@ -22,6 +22,10 @@ import {
   X,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import {
+  UploadConflictModal,
+  suggestRename,
+} from "@/components/confirm-modals";
 
 export type SftpEntry = {
   name: string;
@@ -60,6 +64,11 @@ type TrackedOpenFile = {
   baselineSize: number;
   editState: "synced" | "modified" | "uploading";
 };
+
+type UploadConflictDecision =
+  | { action: "cancel" }
+  | { action: "replace" }
+  | { action: "rename"; name: string };
 
 type SftpViewState = {
   currentPath: string;
@@ -226,6 +235,11 @@ export function SftpView({
   const [busyPath, setBusyPath] = useState<string | null>(null);
   const [transfer, setTransfer] = useState<TransferInfo | null>(null);
   const [dragOver, setDragOver] = useState(false);
+  const [uploadConflict, setUploadConflict] = useState<{
+    fileName: string;
+    renameValue: string;
+    resolve: (decision: UploadConflictDecision) => void;
+  } | null>(null);
   const [trackedOpen, setTrackedOpen] = useState<TrackedOpenFile[]>(
     () => loadViewState(hostId, home).trackedOpen,
   );
@@ -297,14 +311,48 @@ export function SftpView({
   }, [entries, hideDotfiles]);
 
   const uploadLocalToRemote = useCallback(
-    async (localPath: string, remotePath: string, options?: { skipReload?: boolean }) => {
+    async (
+      localPath: string,
+      remotePath: string,
+      options?: { skipReload?: boolean; skipConflictCheck?: boolean },
+    ) => {
+      let targetPath = remotePath;
+      if (!options?.skipConflictCheck) {
+        try {
+          const exists = await invoke<boolean>("sftp_exists", {
+            sessionId,
+            path: targetPath,
+          });
+          if (exists) {
+            const fileName = localFilename(targetPath);
+            const decision = await new Promise<UploadConflictDecision>((resolve) => {
+              setUploadConflict({
+                fileName,
+                renameValue: suggestRename(fileName),
+                resolve,
+              });
+            });
+            if (decision.action === "cancel") {
+              return;
+            }
+            if (decision.action === "rename") {
+              const newName = decision.name.trim() || suggestRename(fileName);
+              targetPath = joinPath(parentPath(targetPath), newName);
+            }
+          }
+        } catch (e) {
+          setError(String(e));
+          throw e;
+        }
+      }
+
       setTransfer({ kind: "upload", name: localFilename(localPath) });
-      setBusyPath(remotePath);
+      setBusyPath(targetPath);
       try {
         await invoke<number>("sftp_upload", {
           sessionId,
           localPath,
-          remotePath,
+          remotePath: targetPath,
         });
         if (!options?.skipReload) {
           await load(currentPathRef.current);
@@ -330,7 +378,10 @@ export function SftpView({
 
   const syncUploadAndRefreshBaseline = useCallback(
     async (t: TrackedOpenFile) => {
-      await uploadLocalToRemote(t.localPath, t.remotePath, { skipReload: false });
+      await uploadLocalToRemote(t.localPath, t.remotePath, {
+        skipReload: false,
+        skipConflictCheck: true,
+      });
       const meta = await invoke<{ mtime: number; size: number }>("file_metadata", { path: t.localPath });
       setTrackedOpen((prev) =>
         prev.map((x) =>
@@ -885,6 +936,31 @@ export function SftpView({
             ))}
           </ul>
         </aside>
+      ) : null}
+
+      {uploadConflict ? (
+        <UploadConflictModal
+          fileName={uploadConflict.fileName}
+          renameValue={uploadConflict.renameValue}
+          onRenameValueChange={(value) =>
+            setUploadConflict((prev) => (prev ? { ...prev, renameValue: value } : prev))
+          }
+          onCancel={() => {
+            uploadConflict.resolve({ action: "cancel" });
+            setUploadConflict(null);
+          }}
+          onReplace={() => {
+            uploadConflict.resolve({ action: "replace" });
+            setUploadConflict(null);
+          }}
+          onRename={() => {
+            uploadConflict.resolve({
+              action: "rename",
+              name: uploadConflict.renameValue.trim(),
+            });
+            setUploadConflict(null);
+          }}
+        />
       ) : null}
     </div>
   );

@@ -880,10 +880,10 @@ async fn ssh_start_shell(
                     }
                 }
 
-                if last_input_log.elapsed() >= Duration::from_millis(250) {
+                if last_input_log.elapsed() >= Duration::from_millis(100) {
                     if input_bytes_since_log > 0 {
                         println!(
-                            "[ssh] input traffic session_id={} bytes_250ms={}",
+                            "[ssh] input traffic session_id={} bytes_100ms={}",
                             worker_session_id, input_bytes_since_log
                         );
                         input_bytes_since_log = 0;
@@ -1223,6 +1223,22 @@ fn splash_is_shown() -> bool {
     SPLASH_SHOWN.load(Ordering::SeqCst)
 }
 
+#[tauri::command]
+fn write_text_file(path: String, contents: String) -> Result<(), String> {
+    if path.trim().is_empty() {
+        return Err("empty path".into());
+    }
+    std::fs::write(&path, contents.as_bytes()).map_err(|e| format!("write {}: {e}", path))
+}
+
+#[tauri::command]
+fn read_text_file(path: String) -> Result<String, String> {
+    if path.trim().is_empty() {
+        return Err("empty path".into());
+    }
+    std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
@@ -1251,6 +1267,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             show_splashscreen,
             splash_is_shown,
+            write_text_file,
+            read_text_file,
             ssh_test_connection,
             ssh_start_shell,
             ssh_send_input,
@@ -1263,6 +1281,7 @@ pub fn run() {
             sftp::sftp_connect,
             sftp::sftp_list,
             sftp::sftp_realpath,
+            sftp::sftp_exists,
             sftp::sftp_mkdir,
             sftp::sftp_remove_file,
             sftp::sftp_remove_dir,
@@ -1284,6 +1303,8 @@ pub fn run() {
             sync::sync_push,
             sync::sync_pull,
             sync::sync_poll_updates,
+            sync::sync_export_transfer_key,
+            sync::sync_import_transfer_key,
             file_metadata,
             proxy::proxy_get,
             proxy::proxy_set_config,

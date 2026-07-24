@@ -5,6 +5,7 @@ export const SYNC_SETTINGS_KEYS = {
   sftpOpenEditMode: "rsshu.settings.sftpOpenEditMode",
   privacyRedactHosts: "rsshu.settings.privacyRedactHosts",
   terminalHostInfoBar: "rsshu.settings.terminalHostInfoBar",
+  terminalDragDropUpload: "rsshu.settings.terminalDragDropUpload",
   tcprawEnabled: "rsshu.settings.tcprawEnabled",
   autoInstallUpdates: "rsshu.settings.autoInstallUpdates",
   quickNavKey: "rsshu.settings.quickNavKey",
@@ -37,6 +38,7 @@ export type SyncSettings = {
   sftpOpenEditMode: "auto" | "confirm";
   privacyRedactHosts: boolean;
   terminalHostInfoBar: boolean;
+  terminalDragDropUpload: boolean;
   tcprawEnabled: boolean;
   autoInstallUpdates: boolean;
   quickNavKey: string;
@@ -80,6 +82,7 @@ export const EMPTY_SYNC_PAYLOAD: SyncPayload = {
     sftpOpenEditMode: "auto",
     privacyRedactHosts: false,
     terminalHostInfoBar: true,
+    terminalDragDropUpload: true,
     tcprawEnabled: false,
     autoInstallUpdates: false,
     quickNavKey: "F2",
@@ -199,6 +202,9 @@ function extractPartialSettings(raw: unknown): Partial<SyncSettings> | null {
   if ("terminalHostInfoBar" in settings) {
     partial.terminalHostInfoBar = settings.terminalHostInfoBar !== false;
   }
+  if ("terminalDragDropUpload" in settings) {
+    partial.terminalDragDropUpload = settings.terminalDragDropUpload !== false;
+  }
   if ("tcprawEnabled" in settings) {
     partial.tcprawEnabled = settings.tcprawEnabled === true;
   }
@@ -243,6 +249,7 @@ export function buildSyncPayload(input: {
   sftpOpenEditMode: "auto" | "confirm";
   privacyRedactHosts: boolean;
   terminalHostInfoBar: boolean;
+  terminalDragDropUpload: boolean;
   tcprawEnabled: boolean;
   autoInstallUpdates: boolean;
   quickNavKey: string;
@@ -259,6 +266,7 @@ export function buildSyncPayload(input: {
       sftpOpenEditMode: input.sftpOpenEditMode,
       privacyRedactHosts: input.privacyRedactHosts,
       terminalHostInfoBar: input.terminalHostInfoBar,
+      terminalDragDropUpload: input.terminalDragDropUpload,
       tcprawEnabled: input.tcprawEnabled,
       autoInstallUpdates: input.autoInstallUpdates,
       quickNavKey: input.quickNavKey,
@@ -305,6 +313,10 @@ export function persistSyncSettings(settings: SyncSettings): void {
       SYNC_SETTINGS_KEYS.terminalHostInfoBar,
       settings.terminalHostInfoBar ? "1" : "0",
     );
+    localStorage.setItem(
+      SYNC_SETTINGS_KEYS.terminalDragDropUpload,
+      settings.terminalDragDropUpload ? "1" : "0",
+    );
     localStorage.setItem(SYNC_SETTINGS_KEYS.tcprawEnabled, settings.tcprawEnabled ? "1" : "0");
     localStorage.setItem(
       SYNC_SETTINGS_KEYS.autoInstallUpdates,
@@ -345,6 +357,12 @@ export function persistPartialSyncSettings(settings: Partial<SyncSettings>): voi
       localStorage.setItem(
         SYNC_SETTINGS_KEYS.terminalHostInfoBar,
         settings.terminalHostInfoBar ? "1" : "0",
+      );
+    }
+    if (settings.terminalDragDropUpload !== undefined) {
+      localStorage.setItem(
+        SYNC_SETTINGS_KEYS.terminalDragDropUpload,
+        settings.terminalDragDropUpload ? "1" : "0",
       );
     }
     if (settings.tcprawEnabled !== undefined) {
@@ -398,6 +416,7 @@ export function loadPersistedSyncSettings(): Partial<SyncSettings> {
     sftpOpenEditMode,
     privacyRedactHosts: readBool(SYNC_SETTINGS_KEYS.privacyRedactHosts),
     terminalHostInfoBar: readBool(SYNC_SETTINGS_KEYS.terminalHostInfoBar, true),
+    terminalDragDropUpload: readBool(SYNC_SETTINGS_KEYS.terminalDragDropUpload, true),
     tcprawEnabled: readBool(SYNC_SETTINGS_KEYS.tcprawEnabled),
     autoInstallUpdates: readBool(SYNC_SETTINGS_KEYS.autoInstallUpdates),
     quickNavKey,

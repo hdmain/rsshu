@@ -1,5 +1,6 @@
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+use argon2::{Algorithm, Argon2, Params, Version};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use rand::RngCore;
@@ -18,7 +19,9 @@ const SYNC_FILE: &str = "sync.json";
 const SYNC_SECRETS_FILE: &str = "sync.secrets.vault";
 const KEY_LEN: usize = 32;
 const NONCE_LEN: usize = 12;
+const SALT_LEN: usize = 16;
 const GIST_FILENAME: &str = "rsshu-sync.txt";
+const TRANSFER_KEY_PREFIX: &str = "rsshu-sync-v1:";
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct SyncConfig {
@@ -475,4 +478,143 @@ pub fn sync_poll_updates(
         has_update: true,
         payload: Some(payload),
     })
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SyncTransferPayload {
+    #[serde(rename = "type")]
+    kind: String,
+    version: u32,
+    github_token: String,
+    gist_id: String,
+    sync_key: String,
+}
+
+fn transfer_argon2_params() -> Result<Params, String> {
+    // Same strength as vault — portable key is short-lived but still sensitive.
+    Params::new(64 * 1024, 3, 1, Some(KEY_LEN)).map_err(|e| e.to_string())
+}
+
+fn derive_transfer_key(password: &str, salt: &[u8]) -> Result<[u8; KEY_LEN], String> {
+    let params = transfer_argon2_params()?;
+    let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut out = [0u8; KEY_LEN];
+    argon
+        .hash_password_into(password.as_bytes(), salt, &mut out)
+        .map_err(|e| format!("argon2: {e}"))?;
+    Ok(out)
+}
+
+fn encrypt_transfer_key(password: &str, payload: &SyncTransferPayload) -> Result<String, String> {
+    if password.len() < 8 {
+        return Err("Transfer password must be at least 8 characters".to_string());
+    }
+    let plaintext = serde_json::to_vec(payload).map_err(|e| format!("serialize transfer: {e}"))?;
+    let mut salt = [0u8; SALT_LEN];
+    let mut nonce_bytes = [0u8; NONCE_LEN];
+    rand::thread_rng().fill_bytes(&mut salt);
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    let key = derive_transfer_key(password, &salt)?;
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| format!("aes key: {e}"))?;
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let ciphertext = cipher
+        .encrypt(nonce, plaintext.as_slice())
+        .map_err(|e| format!("encrypt transfer key: {e}"))?;
+    let mut packed = Vec::with_capacity(SALT_LEN + NONCE_LEN + ciphertext.len());
+    packed.extend_from_slice(&salt);
+    packed.extend_from_slice(&nonce_bytes);
+    packed.extend_from_slice(&ciphertext);
+    Ok(format!("{TRANSFER_KEY_PREFIX}{}", B64.encode(packed)))
+}
+
+fn decrypt_transfer_key(password: &str, transfer_key: &str) -> Result<SyncTransferPayload, String> {
+    if password.len() < 8 {
+        return Err("Transfer password must be at least 8 characters".to_string());
+    }
+    let trimmed = transfer_key.trim();
+    let packed_b64 = trimmed
+        .strip_prefix(TRANSFER_KEY_PREFIX)
+        .ok_or_else(|| "Invalid transfer key (expected rsshu-sync-v1:…)".to_string())?;
+    let packed = B64
+        .decode(packed_b64.as_bytes())
+        .map_err(|e| format!("invalid transfer key encoding: {e}"))?;
+    if packed.len() <= SALT_LEN + NONCE_LEN {
+        return Err("transfer key too short".to_string());
+    }
+    let (salt, rest) = packed.split_at(SALT_LEN);
+    let (nonce_bytes, ciphertext) = rest.split_at(NONCE_LEN);
+    let key = derive_transfer_key(password, salt)?;
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| format!("aes key: {e}"))?;
+    let nonce = Nonce::from_slice(nonce_bytes);
+    let plain = cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|_| "Wrong password or corrupted transfer key".to_string())?;
+    let payload: SyncTransferPayload =
+        serde_json::from_slice(&plain).map_err(|e| format!("invalid transfer payload: {e}"))?;
+    if payload.kind != "rsshu-sync-transfer" || payload.version != 1 {
+        return Err("Unsupported transfer key format".to_string());
+    }
+    if payload.github_token.trim().is_empty()
+        || payload.gist_id.trim().is_empty()
+        || payload.sync_key.trim().is_empty()
+    {
+        return Err("Transfer key is missing sync credentials".to_string());
+    }
+    Ok(payload)
+}
+
+#[tauri::command]
+pub fn sync_export_transfer_key(
+    app: AppHandle,
+    sync: State<'_, SyncState>,
+    vault_state: State<'_, Vault>,
+    password: String,
+) -> Result<String, String> {
+    let cfg = {
+        let mut inner = sync.inner.lock().map_err(|_| "Sync lock poisoned".to_string())?;
+        if inner.config.is_none() {
+            inner.config = read_sync_config(&app)?;
+        }
+        inner
+            .config
+            .clone()
+            .ok_or_else(|| "Enable Cloud Sync first".to_string())?
+    };
+    if !cfg.enabled || cfg.gist_id.trim().is_empty() {
+        return Err("Enable Cloud Sync first".to_string());
+    }
+    let secrets = resolve_sync_secrets(&app, &vault_state, &cfg)?;
+    encrypt_transfer_key(
+        &password,
+        &SyncTransferPayload {
+            kind: "rsshu-sync-transfer".to_string(),
+            version: 1,
+            github_token: secrets.github_token,
+            gist_id: cfg.gist_id,
+            sync_key: secrets.key_b64,
+        },
+    )
+}
+
+#[tauri::command]
+pub fn sync_import_transfer_key(
+    app: AppHandle,
+    sync: State<'_, SyncState>,
+    vault_state: State<'_, Vault>,
+    proxy_state: State<'_, crate::proxy::ProxyState>,
+    transfer_key: String,
+    password: String,
+) -> Result<SyncEnableResponse, String> {
+    let payload = decrypt_transfer_key(&password, &transfer_key)?;
+    sync_enable(
+        app,
+        sync,
+        vault_state,
+        proxy_state,
+        SyncEnableRequest {
+            github_token: payload.github_token,
+            gist_id: Some(payload.gist_id),
+            sync_key: Some(payload.sync_key),
+        },
+    )
 }

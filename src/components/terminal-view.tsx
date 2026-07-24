@@ -1,7 +1,9 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { getTerminalTheme } from "@/lib/themes";
 import { useTheme } from "@/lib/use-theme";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { readText } from "@tauri-apps/plugin-clipboard-manager";
 import { setTerminalClipboardBridge } from "@/lib/terminal-clipboard-bridge";
@@ -10,6 +12,11 @@ import {
   getTerminalSessionBuffer,
   subscribeTerminalSessionOutput,
 } from "@/lib/shell-session-poller";
+import {
+  LinkConfirmModal,
+  UploadConflictModal,
+  suggestRename,
+} from "@/components/confirm-modals";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
@@ -30,6 +37,15 @@ export type TerminalKeywordSettings = {
   };
 };
 
+export type TerminalUploadHost = {
+  host: string;
+  port: number;
+  username: string;
+  password?: string;
+  privateKey?: string;
+  passphrase?: string;
+};
+
 type TerminalViewProps = {
   tabId: string;
   sessionId: string | null;
@@ -37,6 +53,25 @@ type TerminalViewProps = {
   keywordSettings: TerminalKeywordSettings;
   /** Changes when surrounding chrome (e.g. host info bar) resizes the terminal pane. */
   layoutKey?: boolean;
+  dragDropUploadEnabled?: boolean;
+  uploadHost?: TerminalUploadHost | null;
+};
+
+type DropTransfer =
+  | { kind: "probing" }
+  | { kind: "uploading"; current: number; total: number; name: string }
+  | { kind: "done"; ok: number; failed: number }
+  | { kind: "error"; message: string };
+
+type UploadConflictDecision =
+  | { action: "cancel" }
+  | { action: "replace" }
+  | { action: "rename"; name: string };
+
+type UploadConflictState = {
+  fileName: string;
+  renameValue: string;
+  resolve: (decision: UploadConflictDecision) => void;
 };
 
 function hexToRgb(hex: string): { r: number; g: number; b: number } | null {
@@ -78,8 +113,6 @@ function fitTerminal(term: Terminal, fitAddon: FitAddon, host: HTMLElement): { c
   if (xtermEl) {
     let cols = term.cols;
     let rows = term.rows;
-    // FitAddon uses clientHeight which includes padding on the host; trim rows until
-    // the canvas fits so the live prompt row is not clipped under chrome below.
     while (rows > 1 && xtermEl.offsetHeight > host.clientHeight + 1) {
       rows -= 1;
       term.resize(cols, rows);
@@ -100,12 +133,98 @@ function relayoutTerminal(term: Terminal, fitAddon: FitAddon, host: HTMLElement)
   fitTerminal(term, fitAddon, host);
 }
 
+function localFilename(path: string): string {
+  const normalized = path.replace(/\\/g, "/");
+  const idx = normalized.lastIndexOf("/");
+  return idx >= 0 ? normalized.slice(idx + 1) : normalized;
+}
+
+function joinRemotePath(base: string, name: string): string {
+  const file = name.replace(/^\/+/, "");
+  if (!file) return base || "/";
+  const b = (base || "/").replace(/\\/g, "/").replace(/\/+$/, "") || "/";
+  if (b === "/") return `/${file}`;
+  return `${b}/${file}`;
+}
+
+function parseOsc7Path(data: string): string | null {
+  const trimmed = data.trim();
+  if (!trimmed) return null;
+  if (trimmed.startsWith("file://")) {
+    try {
+      const url = new URL(trimmed);
+      const path = decodeURIComponent(url.pathname || "");
+      return path || "/";
+    } catch {
+      const withoutScheme = trimmed.slice("file://".length);
+      const slash = withoutScheme.indexOf("/");
+      if (slash < 0) return null;
+      try {
+        return decodeURIComponent(withoutScheme.slice(slash)) || "/";
+      } catch {
+        return withoutScheme.slice(slash) || "/";
+      }
+    }
+  }
+  if (trimmed.startsWith("/")) return trimmed;
+  return null;
+}
+
+/** Pull OSC 7 paths out of raw PTY output (BEL or ST terminated). */
+function consumeOsc7Paths(chunk: string): string[] {
+  const paths: string[] = [];
+  const re = /\x1b\]7;([^\x07\x1b]*)(?:\x07|\x1b\\)/g;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(chunk)) !== null) {
+    const path = parseOsc7Path(match[1] ?? "");
+    if (path) paths.push(path);
+  }
+  return paths;
+}
+
+function expandRemoteHomePath(path: string, home: string): string {
+  const h = home.replace(/\/+$/, "") || "/";
+  if (path === "~") return h || "/";
+  if (path.startsWith("~/")) {
+    const rest = path.slice(2).replace(/^\/+/, "");
+    return rest ? `${h}/${rest}` : h;
+  }
+  return path;
+}
+
+/** Parse classic bash/zsh prompts like `root@debian:~/browser#` or `user@host:/var/www$`. */
+function parseCwdFromPromptLine(line: string): string | null {
+  const trimmed = line.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "").trimEnd();
+  if (!trimmed) return null;
+  const match = trimmed.match(/:((?:~\/|~|\/)[^#$\s]*)\s*[#$>]\s*$/);
+  if (!match?.[1]) return null;
+  return match[1];
+}
+
+function readCwdFromTerminal(term: Terminal): string | null {
+  const buf = term.buffer.active;
+  const end = buf.baseY + buf.cursorY;
+  const start = Math.max(0, end - 10);
+  for (let y = end; y >= start; y -= 1) {
+    const line = buf.getLine(y)?.translateToString(true) ?? "";
+    const cwd = parseCwdFromPromptLine(line);
+    if (cwd) return cwd;
+  }
+  return null;
+}
+
+function pointInClientRect(x: number, y: number, r: DOMRect): boolean {
+  return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+}
+
 export function TerminalView({
   tabId,
   sessionId,
   onDisconnected,
   keywordSettings,
   layoutKey,
+  dragDropUploadEnabled = true,
+  uploadHost = null,
 }: TerminalViewProps) {
   const { themeId } = useTheme();
   const wrapperRef = useRef<HTMLDivElement | null>(null);
@@ -118,7 +237,188 @@ export function TerminalView({
   const suppressPasteResetTimerRef = useRef<number | null>(null);
   const lastClipboardPayloadRef = useRef<string>("");
   const lastClipboardAtRef = useRef(0);
+  const remoteCwdRef = useRef<string | null>(null);
+  const cwdWaitersRef = useRef<Array<(cwd: string | null) => void>>([]);
+  const suppressProbeOutputRef = useRef(false);
+  const uploadHostRef = useRef(uploadHost);
+  const dragDropEnabledRef = useRef(dragDropUploadEnabled);
+  const uploadingRef = useRef(false);
+  const pendingLinkHandlerRef = useRef<(url: string) => void>(() => {});
   const [terminalReady, setTerminalReady] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
+  const [dropTransfer, setDropTransfer] = useState<DropTransfer | null>(null);
+  const [pendingLink, setPendingLink] = useState<string | null>(null);
+  const [uploadConflict, setUploadConflict] = useState<UploadConflictState | null>(null);
+
+  uploadHostRef.current = uploadHost;
+  dragDropEnabledRef.current = dragDropUploadEnabled;
+  pendingLinkHandlerRef.current = (url: string) => setPendingLink(url);
+
+  const askUploadConflict = useCallback((fileName: string) => {
+    return new Promise<UploadConflictDecision>((resolve) => {
+      setUploadConflict({
+        fileName,
+        renameValue: suggestRename(fileName),
+        resolve,
+      });
+    });
+  }, []);
+
+  const resolveUploadConflict = useCallback((decision: UploadConflictDecision) => {
+    setUploadConflict((prev) => {
+      prev?.resolve(decision);
+      return null;
+    });
+  }, []);
+
+  const noteRemoteCwd = useCallback((cwd: string) => {
+    remoteCwdRef.current = cwd;
+    const waiters = cwdWaitersRef.current.splice(0);
+    for (const resolve of waiters) resolve(cwd);
+  }, []);
+
+  const ingestOutputChunk = useCallback(
+    (chunk: string) => {
+      for (const path of consumeOsc7Paths(chunk)) {
+        noteRemoteCwd(path);
+      }
+    },
+    [noteRemoteCwd],
+  );
+
+  const probeRemoteCwd = useCallback(async (activeSessionId: string): Promise<string | null> => {
+    const term = terminalRef.current;
+    if (term) {
+      const fromPrompt = readCwdFromTerminal(term);
+      if (fromPrompt) {
+        remoteCwdRef.current = fromPrompt;
+        return fromPrompt;
+      }
+    }
+
+    suppressProbeOutputRef.current = true;
+    try {
+      const probed = await new Promise<string | null>((resolve) => {
+        const timer = window.setTimeout(() => {
+          const idx = cwdWaitersRef.current.indexOf(onCwd);
+          if (idx >= 0) cwdWaitersRef.current.splice(idx, 1);
+          resolve(null);
+        }, 1800);
+        function onCwd(cwd: string | null) {
+          window.clearTimeout(timer);
+          resolve(cwd);
+        }
+        cwdWaitersRef.current.push(onCwd);
+        // Space prefix avoids bash history when HISTCONTROL=ignorespace.
+        // Output is suppressed locally so the command never appears in the terminal.
+        const probe =
+          "\u0015 printf '\\033]7;file://localhost%s\\033\\\\' \"$(pwd)\"\r";
+        void invoke("ssh_send_input", { sessionId: activeSessionId, input: probe }).catch(() => {
+          window.clearTimeout(timer);
+          const idx = cwdWaitersRef.current.indexOf(onCwd);
+          if (idx >= 0) cwdWaitersRef.current.splice(idx, 1);
+          resolve(null);
+        });
+      });
+      return probed ?? remoteCwdRef.current;
+    } finally {
+      // Let any late echo chunks settle, then show output again.
+      window.setTimeout(() => {
+        suppressProbeOutputRef.current = false;
+      }, 120);
+    }
+  }, []);
+
+  const resolveUploadDir = useCallback(
+    async (activeSessionId: string, home: string): Promise<string> => {
+      const raw = (await probeRemoteCwd(activeSessionId)) ?? remoteCwdRef.current;
+      if (!raw) return home || "/";
+      return expandRemoteHomePath(raw, home || "/");
+    },
+    [probeRemoteCwd],
+  );
+
+  const uploadDroppedFiles = useCallback(
+    async (paths: string[]) => {
+      if (uploadingRef.current) return;
+      const host = uploadHostRef.current;
+      const activeSessionId = activeSessionIdRef.current;
+      if (!host || !activeSessionId || paths.length === 0) return;
+
+      uploadingRef.current = true;
+      setDropTransfer({ kind: "probing" });
+      let sftpSessionId: string | null = null;
+      let ok = 0;
+      let failed = 0;
+      try {
+        const connected = await invoke<{ session_id: string; home: string }>("sftp_connect", {
+          req: {
+            host: host.host,
+            port: host.port,
+            username: host.username,
+            password: host.password,
+            privateKey: host.privateKey,
+            passphrase: host.passphrase,
+          },
+        });
+        sftpSessionId = connected.session_id;
+        const targetDir = await resolveUploadDir(activeSessionId, connected.home || "/");
+
+        for (let i = 0; i < paths.length; i += 1) {
+          const localPath = paths[i]!;
+          const name = localFilename(localPath);
+          if (!name) {
+            failed += 1;
+            continue;
+          }
+          setDropTransfer({ kind: "uploading", current: i + 1, total: paths.length, name });
+          let remoteName = name;
+          let remotePath = joinRemotePath(targetDir, remoteName);
+          try {
+            const exists = await invoke<boolean>("sftp_exists", {
+              sessionId: sftpSessionId,
+              path: remotePath,
+            });
+            if (exists) {
+              const decision = await askUploadConflict(remoteName);
+              if (decision.action === "cancel") {
+                continue;
+              }
+              if (decision.action === "rename") {
+                remoteName = decision.name.trim() || suggestRename(name);
+                remotePath = joinRemotePath(targetDir, remoteName);
+              }
+            }
+            await invoke<number>("sftp_upload", {
+              sessionId: sftpSessionId,
+              localPath,
+              remotePath,
+            });
+            ok += 1;
+          } catch {
+            failed += 1;
+          }
+          // Yield to the UI thread between files so the terminal stays interactive.
+          await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+        }
+        setDropTransfer({ kind: "done", ok, failed });
+      } catch (err) {
+        setDropTransfer({ kind: "error", message: String(err) });
+      } finally {
+        suppressProbeOutputRef.current = false;
+        if (sftpSessionId) {
+          try {
+            await invoke("sftp_disconnect", { sessionId: sftpSessionId });
+          } catch {
+            // best-effort
+          }
+        }
+        uploadingRef.current = false;
+        window.setTimeout(() => setDropTransfer(null), 2800);
+      }
+    },
+    [resolveUploadDir, askUploadConflict],
+  );
 
   useEffect(() => {
     const term = terminalRef.current;
@@ -159,7 +459,7 @@ export function TerminalView({
       });
       const fitAddon = new FitAddon();
       const webLinksAddon = new WebLinksAddon((_event, uri) => {
-        void openUrl(uri);
+        pendingLinkHandlerRef.current(uri);
       });
       const imageOptions: IImageAddonOptions = {
         enableSizeReports: true,
@@ -183,6 +483,16 @@ export function TerminalView({
         // Unicode11 is optional — terminal still works without it.
       }
       term.open(host);
+
+      try {
+        term.parser.registerOscHandler(7, (data) => {
+          const path = parseOsc7Path(data);
+          if (path) noteRemoteCwd(path);
+          return true;
+        });
+      } catch {
+        // OSC handler optional
+      }
 
       const sendClipboardToPty = (text: string) => {
         const activeSessionId = activeSessionIdRef.current;
@@ -347,7 +657,7 @@ export function TerminalView({
       cleanupRef.current?.();
       cleanupRef.current = null;
     };
-  }, []);
+  }, [noteRemoteCwd]);
 
   useEffect(() => {
     if (!terminalReady) return;
@@ -381,6 +691,7 @@ export function TerminalView({
     const term = terminalRef.current;
     if (!term) return;
     activeSessionIdRef.current = sessionId;
+    remoteCwdRef.current = null;
     if (!sessionId) {
       lastSizeRef.current = null;
       term.clear();
@@ -405,6 +716,7 @@ export function TerminalView({
     term.clear();
     const cached = getTerminalSessionBuffer(sessionId);
     if (cached) {
+      ingestOutputChunk(cached);
       term.write(highlightChunk(cached, keywordSettings));
     }
     term.scrollToBottom();
@@ -416,6 +728,10 @@ export function TerminalView({
     });
 
     const unsubscribeOutput = subscribeTerminalSessionOutput(sessionId, (chunk) => {
+      ingestOutputChunk(chunk);
+      if (suppressProbeOutputRef.current) {
+        return;
+      }
       term.write(highlightChunk(chunk, keywordSettings));
       const buffer = term.buffer.active;
       if (buffer.baseY + term.rows >= buffer.length) {
@@ -427,14 +743,120 @@ export function TerminalView({
       disposeInput.dispose();
       unsubscribeOutput();
     };
-  }, [terminalReady, sessionId, tabId, onDisconnected, keywordSettings]);
+  }, [terminalReady, sessionId, tabId, onDisconnected, keywordSettings, ingestOutputChunk]);
+
+  useEffect(() => {
+    if (!isTauri() || !dragDropUploadEnabled || !uploadHost || !sessionId) {
+      setDragOver(false);
+      return;
+    }
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    void (async () => {
+      const webview = getCurrentWebview();
+      const w = getCurrentWindow();
+      const scaleFactor = await w.scaleFactor();
+      unlisten = await webview.onDragDropEvent((event) => {
+        if (cancelled || !dragDropEnabledRef.current) return;
+        const root = wrapperRef.current;
+        if (event.payload.type === "leave") {
+          setDragOver(false);
+          return;
+        }
+        if (event.payload.type === "enter" || event.payload.type === "over") {
+          if (!root) {
+            setDragOver(false);
+            return;
+          }
+          const r = root.getBoundingClientRect();
+          const lp = event.payload.position.toLogical(scaleFactor);
+          setDragOver(pointInClientRect(lp.x, lp.y, r));
+          return;
+        }
+        if (event.payload.type === "drop") {
+          if (!root) {
+            setDragOver(false);
+            return;
+          }
+          const { paths } = event.payload;
+          const r = root.getBoundingClientRect();
+          const lp = event.payload.position.toLogical(scaleFactor);
+          const inside = pointInClientRect(lp.x, lp.y, r);
+          setDragOver(false);
+          if (!inside || paths.length === 0) return;
+          void uploadDroppedFiles(paths);
+        }
+      });
+    })();
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [dragDropUploadEnabled, uploadHost, sessionId, uploadDroppedFiles]);
 
   return (
     <div
       ref={wrapperRef}
-      className="app-surface relative flex h-full min-h-0 w-full flex-1 px-3 py-2"
+      className={`app-surface relative flex h-full min-h-0 w-full flex-1 px-3 py-2 ${
+        dragOver ? "ring-2 ring-inset ring-[rgb(var(--app-accent)/0.55)]" : ""
+      }`}
     >
       <div ref={hostRef} className="h-full min-h-0 w-full overflow-hidden" />
+      {dragOver ? (
+        <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center bg-[rgb(var(--app-accent)/0.08)]">
+          <div className="app-panel rounded-md border px-4 py-3 text-sm shadow-lg">
+            Drop files to upload into the current remote folder
+          </div>
+        </div>
+      ) : null}
+      {dropTransfer ? (
+        <div className="pointer-events-none absolute bottom-3 left-1/2 z-20 -translate-x-1/2">
+          <div className="app-panel rounded-md border px-3 py-2 text-xs shadow-lg">
+            {dropTransfer.kind === "probing" ? "Detecting remote folder…" : null}
+            {dropTransfer.kind === "uploading"
+              ? `Uploading ${dropTransfer.current}/${dropTransfer.total}: ${dropTransfer.name}`
+              : null}
+            {dropTransfer.kind === "done"
+              ? dropTransfer.failed > 0
+                ? `Uploaded ${dropTransfer.ok}, failed ${dropTransfer.failed}`
+                : `Uploaded ${dropTransfer.ok} file${dropTransfer.ok === 1 ? "" : "s"}`
+              : null}
+            {dropTransfer.kind === "error" ? (
+              <span className="text-destructive">{dropTransfer.message}</span>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+      {pendingLink ? (
+        <LinkConfirmModal
+          url={pendingLink}
+          onCancel={() => setPendingLink(null)}
+          onOpen={() => {
+            const url = pendingLink;
+            setPendingLink(null);
+            void openUrl(url).catch(() => {
+              // ignore
+            });
+          }}
+        />
+      ) : null}
+      {uploadConflict ? (
+        <UploadConflictModal
+          fileName={uploadConflict.fileName}
+          renameValue={uploadConflict.renameValue}
+          onRenameValueChange={(value) =>
+            setUploadConflict((prev) => (prev ? { ...prev, renameValue: value } : prev))
+          }
+          onCancel={() => resolveUploadConflict({ action: "cancel" })}
+          onReplace={() => resolveUploadConflict({ action: "replace" })}
+          onRename={() =>
+            resolveUploadConflict({
+              action: "rename",
+              name: uploadConflict.renameValue.trim(),
+            })
+          }
+        />
+      ) : null}
     </div>
   );
 }

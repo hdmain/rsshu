@@ -233,7 +233,7 @@ export function saveCustomTheme(config: CustomThemeConfig): void {
   }
 }
 
-function normalizeCustomTheme(input: Partial<CustomThemeConfig> | null | undefined): CustomThemeConfig {
+export function normalizeCustomTheme(input: Partial<CustomThemeConfig> | null | undefined): CustomThemeConfig {
   const parsed = input ?? {};
   return {
     name: (parsed.name ?? DEFAULT_CUSTOM_THEME.name).trim() || DEFAULT_CUSTOM_THEME.name,

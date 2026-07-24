@@ -20,7 +20,10 @@ fn ssh_runtime() -> &'static TokioHandle {
         std::thread::Builder::new()
             .name("rsshu-ssh-rt".into())
             .spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
+                // Multi-thread so interactive shells keep running while SFTP transfers work.
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(4)
+                    .thread_name("rsshu-ssh-worker")
                     .enable_all()
                     .build()
                     .expect("failed to create SSH runtime");
@@ -44,6 +47,19 @@ where
         let _ = tx.send(future.await);
     });
     rx.recv().unwrap_or_else(|_| panic!("SSH runtime task dropped"))
+}
+
+/// Async variant — does not block the calling thread while the SSH task runs.
+pub async fn run_async<F, T>(future: F) -> T
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = ssh_runtime().spawn(async move {
+        let _ = tx.send(future.await);
+    });
+    rx.await.unwrap_or_else(|_| panic!("SSH runtime task dropped"))
 }
 
 #[derive(Clone)]

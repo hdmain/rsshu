@@ -1,10 +1,12 @@
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { readText } from "@tauri-apps/plugin-clipboard-manager";
+import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
+import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import {
   ChevronDown,
   ChevronRight,
+  Download,
   Edit3,
   Folder,
   FolderOpen,
@@ -21,6 +23,7 @@ import {
   Terminal,
   Trash2,
   Unplug,
+  Upload,
   Eye,
   EyeOff,
   X,
@@ -54,6 +57,11 @@ import {
   redactConnectionLogLine,
 } from "@/lib/privacy-display";
 import {
+  buildBackupJson,
+  defaultBackupFilename,
+  parseBackupPayload,
+} from "@/lib/backup";
+import {
   buildSyncPayloadJson,
   DEFAULT_TERMINAL_KEYWORD_SETTINGS,
   loadPersistedSyncSettings,
@@ -62,6 +70,7 @@ import {
   SYNC_SETTINGS_KEYS,
   type ParsedSyncPayload,
 } from "@/lib/sync-payload";
+import { useTheme } from "@/lib/use-theme";
 
 type Host = {
   id: string;
@@ -376,10 +385,18 @@ function App() {
   const [syncGistId, setSyncGistId] = useState("");
   const [syncKey, setSyncKey] = useState("");
   const [syncReadyForPush, setSyncReadyForPush] = useState(false);
+  const [transferPassword, setTransferPassword] = useState("");
+  const [transferImportKey, setTransferImportKey] = useState("");
+  const [transferImportPassword, setTransferImportPassword] = useState("");
+  const [backupBusy, setBackupBusy] = useState(false);
+  const [backupError, setBackupError] = useState("");
+  const [backupInfo, setBackupInfo] = useState("");
+  const { themeId, customTheme, setTheme, setCustomTheme } = useTheme();
   const SFTP_HIDE_DOTFILES_KEY = SYNC_SETTINGS_KEYS.sftpHideDotfiles;
   const SFTP_OPEN_EDIT_KEY = SYNC_SETTINGS_KEYS.sftpOpenEditMode;
   const PRIVACY_REDACT_HOSTS_KEY = SYNC_SETTINGS_KEYS.privacyRedactHosts;
   const TERMINAL_HOST_INFO_BAR_KEY = SYNC_SETTINGS_KEYS.terminalHostInfoBar;
+  const TERMINAL_DRAG_DROP_KEY = SYNC_SETTINGS_KEYS.terminalDragDropUpload;
   const TCPRAW_ENABLED_KEY = SYNC_SETTINGS_KEYS.tcprawEnabled;
   const AUTO_INSTALL_UPDATES_KEY = SYNC_SETTINGS_KEYS.autoInstallUpdates;
   const QUICK_NAV_KEY_STORAGE = SYNC_SETTINGS_KEYS.quickNavKey;
@@ -391,6 +408,7 @@ function App() {
   const [sftpOpenEditMode, setSftpOpenEditMode] = useState<"auto" | "confirm">("auto");
   const [privacyRedactHosts, setPrivacyRedactHosts] = useState(false);
   const [showTerminalHostInfoBar, setShowTerminalHostInfoBar] = useState(true);
+  const [terminalDragDropUpload, setTerminalDragDropUpload] = useState(true);
   const [tcprawEnabled, setTcprawEnabled] = useState(false);
   const [tcprawCode, setTcprawCode] = useState<string | null>(null);
   const [autoInstallUpdates, setAutoInstallUpdates] = useState(false);
@@ -443,6 +461,15 @@ function App() {
     try {
       const v = localStorage.getItem(TERMINAL_HOST_INFO_BAR_KEY);
       if (v === "0" || v === "false") setShowTerminalHostInfoBar(false);
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      const v = localStorage.getItem(TERMINAL_DRAG_DROP_KEY);
+      if (v === "0" || v === "false") setTerminalDragDropUpload(false);
     } catch {
       // ignore
     }
@@ -541,6 +568,9 @@ function App() {
     if (settings.terminalHostInfoBar !== undefined) {
       setShowTerminalHostInfoBar(settings.terminalHostInfoBar);
     }
+    if (settings.terminalDragDropUpload !== undefined) {
+      setTerminalDragDropUpload(settings.terminalDragDropUpload);
+    }
     if (settings.tcprawEnabled !== undefined) setTcprawEnabled(settings.tcprawEnabled);
     if (settings.autoInstallUpdates !== undefined) setAutoInstallUpdates(settings.autoInstallUpdates);
     if (settings.quickNavKey !== undefined) setQuickNavKey(settings.quickNavKey);
@@ -572,6 +602,7 @@ function App() {
         sftpOpenEditMode,
         privacyRedactHosts,
         terminalHostInfoBar: showTerminalHostInfoBar,
+        terminalDragDropUpload,
         tcprawEnabled,
         autoInstallUpdates,
         quickNavKey,
@@ -586,6 +617,7 @@ function App() {
       sftpOpenEditMode,
       privacyRedactHosts,
       showTerminalHostInfoBar,
+      terminalDragDropUpload,
       tcprawEnabled,
       autoInstallUpdates,
       quickNavKey,
@@ -870,6 +902,144 @@ function App() {
       setSyncError(String(err));
     } finally {
       setSyncBusy(false);
+    }
+  }
+
+  async function exportSyncTransferKey() {
+    setSyncBusy(true);
+    setSyncError("");
+    setSyncInfo("");
+    try {
+      const key = await invoke<string>("sync_export_transfer_key", {
+        password: transferPassword,
+      });
+      await writeText(key);
+      setTransferPassword("");
+      setSyncInfo("Transfer key copied to clipboard. Use the same password on the other computer.");
+    } catch (err) {
+      setSyncError(String(err));
+    } finally {
+      setSyncBusy(false);
+    }
+  }
+
+  async function importSyncTransferKey() {
+    setSyncBusy(true);
+    setSyncError("");
+    setSyncInfo("");
+    try {
+      const res = await invoke<SyncEnableResponse>("sync_import_transfer_key", {
+        transferKey: transferImportKey,
+        password: transferImportPassword,
+      });
+      setSyncEnabled(true);
+      setSyncReadyForPush(false);
+      setSyncGistId(res.gist_id);
+      setSyncKey(res.sync_key);
+      setSyncToken("");
+      setTransferImportKey("");
+      setTransferImportPassword("");
+
+      const json = await invoke<string>("sync_pull");
+      const parsed = parseSyncPayload(json);
+      await applySyncPayload(parsed);
+      setSyncReadyForPush(true);
+      setSyncInfo(
+        parsed.settings
+          ? "Transfer key applied. Hosts and settings pulled from cloud."
+          : "Transfer key applied. Hosts pulled from cloud.",
+      );
+    } catch (err) {
+      setSyncError(String(err));
+    } finally {
+      setSyncBusy(false);
+    }
+  }
+
+  async function exportBackup() {
+    setBackupBusy(true);
+    setBackupError("");
+    setBackupInfo("");
+    try {
+      const json = buildBackupJson({
+        hosts,
+        sftpHideDotfiles,
+        sftpOpenEditMode,
+        privacyRedactHosts,
+        terminalHostInfoBar: showTerminalHostInfoBar,
+        terminalDragDropUpload,
+        tcprawEnabled,
+        autoInstallUpdates,
+        quickNavKey,
+        connectCounts,
+        terminalKeywordSettings,
+        proxyServers: proxyStore.servers,
+        proxyConfig: proxyStore.config,
+        theme: themeId,
+        customTheme,
+      });
+      const destination = await saveDialog({
+        title: "Export RSSHU backup",
+        defaultPath: defaultBackupFilename(),
+        filters: [{ name: "RSSHU Backup", extensions: ["json"] }],
+      });
+      if (!destination) {
+        setBackupInfo("Export cancelled.");
+        return;
+      }
+      await invoke("write_text_file", { path: destination, contents: json });
+      setBackupInfo(
+        `Exported ${hosts.length} host(s), passwords, keys, proxy, and settings to ${destination}`,
+      );
+    } catch (err) {
+      setBackupError(String(err));
+    } finally {
+      setBackupBusy(false);
+    }
+  }
+
+  async function importBackup() {
+    setBackupBusy(true);
+    setBackupError("");
+    setBackupInfo("");
+    try {
+      const selected = await openDialog({
+        title: "Import RSSHU backup",
+        multiple: false,
+        directory: false,
+        filters: [{ name: "RSSHU Backup", extensions: ["json"] }],
+      });
+      if (!selected || Array.isArray(selected)) {
+        setBackupInfo("Import cancelled.");
+        return;
+      }
+      const confirmed = window.confirm(
+        "Import will replace current hosts, passwords, private keys, proxy servers, and settings on this machine. Continue?",
+      );
+      if (!confirmed) {
+        setBackupInfo("Import cancelled.");
+        return;
+      }
+      const raw = await invoke<string>("read_text_file", { path: selected });
+      const parsed = parseBackupPayload(raw);
+      skipNextSaveRef.current = true;
+      await applySyncPayload(parsed);
+      if (parsed.local?.customTheme) {
+        setCustomTheme(parsed.local.customTheme);
+      }
+      if (parsed.local?.theme) {
+        setTheme(parsed.local.theme);
+      }
+      const hostCount = Array.isArray(parsed.hosts) ? parsed.hosts.length : 0;
+      setBackupInfo(
+        `Imported ${hostCount} host(s)${parsed.settings ? ", settings, and proxy" : ""}${
+          parsed.local ? ", theme" : ""
+        }.`,
+      );
+    } catch (err) {
+      setBackupError(String(err));
+    } finally {
+      setBackupBusy(false);
     }
   }
 
@@ -2388,6 +2558,39 @@ function App() {
                             />
                           </button>
                         </div>
+                        <div className="app-card app-soft flex items-center justify-between rounded-md px-3 py-2">
+                          <div>
+                            <p className="app-text-strong text-sm font-medium">Drag-and-drop Terminal</p>
+                            <p className="app-text-muted text-xs">
+                              Drop one or more files onto the terminal to upload them into the current remote
+                              folder (detected via the shell working directory).
+                            </p>
+                          </div>
+                          <button
+                            type="button"
+                            aria-label="Toggle terminal drag-and-drop upload"
+                            onClick={() => {
+                              setTerminalDragDropUpload((v) => {
+                                const next = !v;
+                                try {
+                                  localStorage.setItem(TERMINAL_DRAG_DROP_KEY, next ? "1" : "0");
+                                } catch {
+                                  // ignore
+                                }
+                                return next;
+                              });
+                            }}
+                            className={`relative h-6 w-11 shrink-0 rounded-full transition ${
+                              terminalDragDropUpload ? "app-toggle-on" : "app-toggle-off"
+                            }`}
+                          >
+                            <span
+                              className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition ${
+                                terminalDragDropUpload ? "left-[22px]" : "left-0.5"
+                              }`}
+                            />
+                          </button>
+                        </div>
                       </div>
                     </CardContent>
                   </Card>
@@ -2515,6 +2718,39 @@ function App() {
 
                   <Card className="app-panel border shadow-xl">
                     <CardHeader>
+                      <CardTitle className="app-text-strong">Backup &amp; Restore</CardTitle>
+                      <CardDescription>
+                        Export all hosts, passwords, private keys, proxy servers, connect counts, and
+                        settings to a JSON file — or restore them on another machine. The file is
+                        plaintext; store it somewhere safe.
+                      </CardDescription>
+                    </CardHeader>
+                    <CardContent className="space-y-3">
+                      <div className="flex flex-wrap gap-2">
+                        <Button disabled={backupBusy} onClick={() => void exportBackup()}>
+                          <Download className="mr-1.5 h-3.5 w-3.5" />
+                          Export all data
+                        </Button>
+                        <Button
+                          disabled={backupBusy}
+                          variant="outline"
+                          onClick={() => void importBackup()}
+                        >
+                          <Upload className="mr-1.5 h-3.5 w-3.5" />
+                          Import backup
+                        </Button>
+                      </div>
+                      {backupInfo ? <p className="text-xs text-emerald-300">{backupInfo}</p> : null}
+                      {backupError ? <p className="text-xs text-destructive">{backupError}</p> : null}
+                      <p className="app-text-muted text-xs">
+                        Includes SSH credentials and proxy passwords. Does not include your vault
+                        master password or GitHub sync token.
+                      </p>
+                    </CardContent>
+                  </Card>
+
+                  <Card className="app-panel border shadow-xl">
+                    <CardHeader>
                       <CardTitle className="app-text-strong">Cloud Sync (GitHub Gist)</CardTitle>
                       <CardDescription>
                         Auto-sync encrypted hosts and app settings across devices. Theme stays local on each
@@ -2558,11 +2794,63 @@ function App() {
                       </div>
                       {syncInfo ? <p className="text-xs text-emerald-300">{syncInfo}</p> : null}
                       {syncError ? <p className="text-xs text-destructive">{syncError}</p> : null}
+
+                      <Separator className="my-1" />
+
+                      <div className="space-y-2">
+                        <p className="app-text-strong text-sm font-medium">Transfer key</p>
+                        <p className="app-text-muted text-xs">
+                          Encrypt Cloud Sync credentials (GitHub token, Gist ID, sync key) with a password,
+                          copy the key, then paste it on another computer to enable sync and pull the vault
+                          data from the cloud.
+                        </p>
+                        <div className="flex flex-col gap-2 sm:flex-row">
+                          <Input
+                            type="password"
+                            placeholder="Password to encrypt (≥8 chars)"
+                            value={transferPassword}
+                            onChange={(e) => setTransferPassword(e.target.value)}
+                            className="sm:flex-1"
+                          />
+                          <Button
+                            disabled={syncBusy || !syncEnabled || transferPassword.length < 8}
+                            variant="outline"
+                            onClick={() => void exportSyncTransferKey()}
+                          >
+                            Create &amp; copy key
+                          </Button>
+                        </div>
+                        <textarea
+                          className="min-h-[72px] w-full resize-y rounded-md border border-input bg-background p-3 text-xs font-mono"
+                          placeholder="Paste transfer key (rsshu-sync-v1:…)"
+                          value={transferImportKey}
+                          onChange={(e) => setTransferImportKey(e.target.value)}
+                        />
+                        <div className="flex flex-col gap-2 sm:flex-row">
+                          <Input
+                            type="password"
+                            placeholder="Password to decrypt"
+                            value={transferImportPassword}
+                            onChange={(e) => setTransferImportPassword(e.target.value)}
+                            className="sm:flex-1"
+                          />
+                          <Button
+                            disabled={
+                              syncBusy ||
+                              transferImportKey.trim().length === 0 ||
+                              transferImportPassword.length < 8
+                            }
+                            onClick={() => void importSyncTransferKey()}
+                          >
+                            Apply key &amp; pull
+                          </Button>
+                        </div>
+                      </div>
+
                       <p className="app-text-muted text-xs">
                         Once sync is on, changes to hosts and settings (except theme) are automatically written
-                        to the Gist. On another machine, use the same Gist ID and Sync key, then click Pull Now.
-                        If you used the old hosts-only sync, click Push Now on the machine that has proxy and
-                        settings configured, then Pull Now on the other machine.
+                        to the Gist. On another machine, use a transfer key (or the same Gist ID and Sync key),
+                        then Pull Now if needed.
                       </p>
                     </CardContent>
                   </Card>
@@ -3038,6 +3326,19 @@ function App() {
                 sessionId={activeTab.sessionId}
                 keywordSettings={terminalKeywordSettings}
                 layoutKey={showTerminalHostInfoBar}
+                dragDropUploadEnabled={terminalDragDropUpload}
+                uploadHost={
+                  activeTabHost
+                    ? {
+                        host: activeTabHost.host,
+                        port: activeTabHost.port,
+                        username: activeTabHost.username,
+                        password: activeTabHost.password,
+                        privateKey: activeTabHost.privateKey,
+                        passphrase: activeTabHost.passphrase,
+                      }
+                    : null
+                }
                 onDisconnected={handleSessionLost}
               />
             </div>

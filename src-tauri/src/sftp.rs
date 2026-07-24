@@ -148,20 +148,16 @@ pub async fn sftp_connect(
     );
     let proxy = (*proxy_state).clone();
     let params = connect_params(&req);
-    let (session, home) = tauri::async_runtime::spawn_blocking(move || {
-        let proxy_for_connect = proxy.clone();
-        ssh_client::block_on(async move {
-            let session = ssh_client::connect_async(params, proxy_for_connect).await?;
-            let sftp = ssh_client::open_sftp_session(&session).await?;
-            let home = sftp
-                .canonicalize(".")
-                .await
-                .unwrap_or_else(|_| "/".to_string());
-            Ok::<(SshHandle, String), anyhow::Error>((session, home))
-        })
+    let (session, home) = ssh_client::run_async(async move {
+        let session = ssh_client::connect_async(params, proxy).await?;
+        let sftp = ssh_client::open_sftp_session(&session).await?;
+        let home = sftp
+            .canonicalize(".")
+            .await
+            .unwrap_or_else(|_| "/".to_string());
+        Ok::<(SshHandle, String), anyhow::Error>((session, home))
     })
     .await
-    .map_err(|e| format!("SFTP connect worker thread failed: {e}"))?
     .map_err(|e| e.to_string())?;
 
     let id = sessions.create_id();
@@ -306,6 +302,26 @@ pub fn sftp_realpath(
 }
 
 #[tauri::command]
+pub async fn sftp_exists(
+    session_id: String,
+    path: String,
+    sessions: State<'_, SftpSessions>,
+) -> Result<bool, String> {
+    let path = normalize(&path);
+    let session = sftp_ssh_session(&sessions, &session_id)?;
+    ssh_client::run_async(async move {
+        let handle = session.lock().await;
+        let sftp = ssh_client::open_sftp_session(&handle)
+            .await
+            .map_err(|e| e.to_string())?;
+        sftp.try_exists(&path)
+            .await
+            .map_err(|e| format!("exists {path}: {e}"))
+    })
+    .await
+}
+
+#[tauri::command]
 pub fn sftp_mkdir(
     session_id: String,
     path: String,
@@ -379,7 +395,7 @@ pub fn sftp_rename(
 }
 
 #[tauri::command]
-pub fn sftp_download(
+pub async fn sftp_download(
     session_id: String,
     remote_path: String,
     local_path: String,
@@ -397,7 +413,7 @@ pub fn sftp_download(
         }
     }
     let session = sftp_ssh_session(&sessions, &session_id)?;
-    ssh_client::block_on(async move {
+    ssh_client::run_async(async move {
         let handle = session.lock().await;
         let sftp = ssh_client::open_sftp_session(&handle)
             .await
@@ -423,16 +439,18 @@ pub fn sftp_download(
                 .await
                 .map_err(|e| format!("write local: {e}"))?;
             total += n as u64;
+            tokio::task::yield_now().await;
         }
         file.flush()
             .await
             .map_err(|e| format!("flush: {e}"))?;
         Ok(total)
     })
+    .await
 }
 
 #[tauri::command]
-pub fn sftp_upload(
+pub async fn sftp_upload(
     session_id: String,
     local_path: String,
     remote_path: String,
@@ -443,7 +461,7 @@ pub fn sftp_upload(
         session_id, local_path, remote_path
     );
     let session = sftp_ssh_session(&sessions, &session_id)?;
-    ssh_client::block_on(async move {
+    ssh_client::run_async(async move {
         let handle = session.lock().await;
         let sftp = ssh_client::open_sftp_session(&handle)
             .await
@@ -471,9 +489,12 @@ pub fn sftp_upload(
                 .await
                 .map_err(|e| format!("write remote: {e}"))?;
             total += n as u64;
+            // Yield so interactive SSH sessions on the same runtime stay responsive.
+            tokio::task::yield_now().await;
         }
         Ok(total)
     })
+    .await
 }
 
 #[tauri::command]
