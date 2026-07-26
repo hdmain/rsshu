@@ -147,6 +147,7 @@ type ProxyConfig = {
   applySsh: boolean;
   applyHttp: boolean;
   lockdown: boolean;
+  bypassLocal: boolean;
 };
 type ProxyStats = {
   totalBytes: number;
@@ -174,6 +175,7 @@ const defaultProxyConfig: ProxyConfig = {
   applySsh: true,
   applyHttp: true,
   lockdown: false,
+  bypassLocal: true,
 };
 
 const defaultProxyStore: ProxyStore = {
@@ -2148,9 +2150,14 @@ function App() {
                             desc: "GitHub sync, update checks, and installer downloads.",
                           },
                           {
+                            key: "bypassLocal" as const,
+                            title: "Bypass proxy for local servers",
+                            desc: "Connect directly to localhost and private LAN addresses (192.168/10/172.16, .local).",
+                          },
+                          {
                             key: "lockdown" as const,
                             title: "Lockdown (no direct fallback)",
-                            desc: "Block direct connections when proxy is enabled for that scope.",
+                            desc: "Block direct connections when proxy is enabled for that scope. Local bypass still applies.",
                           },
                         ].map(({ key, title, desc }) => (
                           <div

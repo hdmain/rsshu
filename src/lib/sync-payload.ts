@@ -31,6 +31,7 @@ export type SyncProxyConfig = {
   applySsh: boolean;
   applyHttp: boolean;
   lockdown: boolean;
+  bypassLocal: boolean;
 };
 
 export type SyncSettings = {
@@ -96,6 +97,7 @@ export const EMPTY_SYNC_PAYLOAD: SyncPayload = {
         applySsh: true,
         applyHttp: true,
         lockdown: false,
+        bypassLocal: true,
       },
     },
   },
@@ -157,6 +159,7 @@ function parseProxyConfig(raw: unknown): SyncProxyConfig {
     applySsh: config.applySsh !== false,
     applyHttp: config.applyHttp !== false,
     lockdown: config.lockdown === true,
+    bypassLocal: config.bypassLocal !== false,
   };
 }
 

@@ -141,21 +141,21 @@ fn connect_ssh<F: Fn(&str) + Send + Sync + 'static>(
         "TCP: opening socket to {}:{}…",
         req.host, req.port
     ));
-    if let Some(p) = {
+    {
         let s = proxy_state.effective_settings();
-        if s.should_use_for(true) || s.lockdown_blocks(true) {
-            Some(s)
-        } else {
-            None
-        }
-    } {
-        if p.should_use_for(true) {
+        if s.should_use_for_host(true, &req.host) {
             progress(&format!(
                 "Proxy: tunneling via {} {}:{} → {}:{}…",
-                p.proxy_type, p.host, p.port, req.host, req.port
+                s.proxy_type, s.host, s.port, req.host, req.port
             ));
-        } else if p.lockdown_blocks(true) {
+        } else if s.lockdown_blocks_host(true, &req.host) {
             anyhow::bail!("Lockdown mode: direct SSH connections are blocked");
+        } else if s.bypass_local && s.should_use_for(true) && proxy::is_local_or_private_host(&req.host)
+        {
+            progress(&format!(
+                "Proxy: bypassed for local/private host {} — connecting directly…",
+                req.host
+            ));
         }
     }
     progress("SSH: connecting and negotiating…");

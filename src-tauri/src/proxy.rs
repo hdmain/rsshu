@@ -50,6 +50,9 @@ pub struct ProxyConfig {
     pub apply_http: bool,
     #[serde(default)]
     pub lockdown: bool,
+    /// When true, localhost / private LAN targets connect directly (no proxy).
+    #[serde(default = "default_true")]
+    pub bypass_local: bool,
 }
 
 impl Default for ProxyConfig {
@@ -60,6 +63,7 @@ impl Default for ProxyConfig {
             apply_ssh: true,
             apply_http: true,
             lockdown: false,
+            bypass_local: true,
         }
     }
 }
@@ -116,6 +120,8 @@ struct LegacyProxySettings {
     apply_http: bool,
     #[serde(default)]
     lockdown: bool,
+    #[serde(default = "default_true")]
+    bypass_local: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -130,6 +136,7 @@ pub struct ProxySettings {
     pub apply_ssh: bool,
     pub apply_http: bool,
     pub lockdown: bool,
+    pub bypass_local: bool,
 }
 
 fn default_proxy_type() -> String {
@@ -153,8 +160,22 @@ impl ProxySettings {
         self.is_configured() && (if for_ssh { self.apply_ssh } else { self.apply_http })
     }
 
+    pub fn should_use_for_host(&self, for_ssh: bool, target_host: &str) -> bool {
+        if self.bypass_local && is_local_or_private_host(target_host) {
+            return false;
+        }
+        self.should_use_for(for_ssh)
+    }
+
     pub fn lockdown_blocks(&self, for_ssh: bool) -> bool {
         self.lockdown && self.is_configured() && (if for_ssh { self.apply_ssh } else { self.apply_http })
+    }
+
+    pub fn lockdown_blocks_host(&self, for_ssh: bool, target_host: &str) -> bool {
+        if self.bypass_local && is_local_or_private_host(target_host) {
+            return false;
+        }
+        self.lockdown_blocks(for_ssh)
     }
 
     fn creds(&self) -> Option<(&str, &str)> {
@@ -166,6 +187,40 @@ impl ProxySettings {
             Some((u, p))
         }
     }
+}
+
+/// True for localhost, loopback, and RFC1918 / link-local private addresses.
+pub fn is_local_or_private_host(host: &str) -> bool {
+    let h = host.trim().trim_matches(|c| c == '[' || c == ']').to_ascii_lowercase();
+    if h.is_empty() {
+        return false;
+    }
+    if h == "localhost" || h == "localhost." || h.ends_with(".localhost") || h.ends_with(".local") {
+        return true;
+    }
+    if h == "::1" || h == "0:0:0:0:0:0:0:1" {
+        return true;
+    }
+    // Strip optional zone id from IPv6 link-local (fe80::1%eth0).
+    let h = h.split('%').next().unwrap_or(&h);
+
+    if let Ok(ip) = h.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 0x40 // 100.64/10 CGNAT
+            }
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback()
+                    || (v6.segments()[0] & 0xfe00) == 0xfc00 // ULA fc00::/7
+                    || (v6.segments()[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+            }
+        };
+    }
+
+    false
 }
 
 struct ProxyMeter {
@@ -296,6 +351,7 @@ impl ProxyState {
                 apply_ssh: store.config.apply_ssh,
                 apply_http: store.config.apply_http,
                 lockdown: store.config.lockdown,
+                bypass_local: store.config.bypass_local,
             }
         } else {
             ProxySettings {
@@ -309,6 +365,7 @@ impl ProxyState {
                 apply_ssh: store.config.apply_ssh,
                 apply_http: store.config.apply_http,
                 lockdown: store.config.lockdown,
+                bypass_local: store.config.bypass_local,
             }
         }
     }
@@ -387,6 +444,7 @@ fn migrate_legacy(legacy: LegacyProxySettings) -> ProxyStore {
     store.config.apply_ssh = legacy.apply_ssh;
     store.config.apply_http = legacy.apply_http;
     store.config.lockdown = legacy.lockdown;
+    store.config.bypass_local = legacy.bypass_local;
 
     if !legacy.host.trim().is_empty() {
         let id = Uuid::new_v4().to_string();
@@ -731,14 +789,14 @@ pub async fn open_connection(
     for_ssh: bool,
 ) -> Result<ProxyStream> {
     let settings = state.effective_settings();
-    if settings.should_use_for(for_ssh) {
+    if settings.should_use_for_host(for_ssh, target_host) {
         let server_id = settings
             .active_server_id
             .clone()
             .unwrap_or_else(|| "unknown".to_string());
         return connect_via_proxy(&settings, target_host, target_port, state.meter(&server_id)).await;
     }
-    if settings.lockdown_blocks(for_ssh) {
+    if settings.lockdown_blocks_host(for_ssh, target_host) {
         bail!("Lockdown mode: direct connections are blocked — configure and enable the proxy");
     }
     let stream = TcpStream::connect((target_host, target_port))
@@ -793,6 +851,7 @@ fn settings_from_server(server: &ProxyServer, config: &ProxyConfig) -> ProxySett
         apply_ssh: config.apply_ssh,
         apply_http: config.apply_http,
         lockdown: config.lockdown,
+        bypass_local: config.bypass_local,
     }
 }
 
