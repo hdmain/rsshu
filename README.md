@@ -17,7 +17,7 @@
 ---
 
 ## Overview
-
+moved to https://github.com/hdmain/clientosh
 **RSSHU** is a lightweight, native desktop SSH & SFTP client built with [Tauri 2](https://tauri.app), React, and Rust. It solves the common developer pain point of managing multiple remote servers — juggling credentials, remembering hostnames, and syncing settings across machines — by providing a polished, privacy-first interface with an **encrypted local vault** and optional **GitHub Gist sync**.
 
 No subscriptions. No telemetry. Runs on Linux and Windows. Your credentials stay yours.
